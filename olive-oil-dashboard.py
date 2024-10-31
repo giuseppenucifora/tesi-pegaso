@@ -299,51 +299,6 @@ scaler_temporal = joblib.load('./models/oli_transformer/scaler_temporal.joblib')
 scaler_static = joblib.load('./models/oli_transformer/scaler_static.joblib')
 scaler_y = joblib.load('./models/oli_transformer/scaler_y.joblib')
 
-def prepare_monthly_weather_stats(weather_data):
-    """Prepara le statistiche mensili dal weather_data."""
-    monthly_stats = weather_data.groupby(['year', 'month']).agg({
-        'temp': 'mean',
-        'precip': 'sum',
-        'solarradiation': 'sum'  # useremo questo come proxy per solar_energy_sum
-    }).reset_index()
-
-    monthly_stats.columns = ['year', 'month', 'temp_mean', 'precip_sum', 'solar_energy_sum']
-    return monthly_stats
-
-def prepare_static_features(variety_info, hectares):
-    """Prepara le feature statiche nello stesso formato usato durante il training."""
-    # Inizializza un array con il numero di ettari
-    static_features = [hectares]
-
-    # Aggiungi le feature della varietà
-    variety_name = variety_info['Varietà di Olive'].lower().replace(" ", "_").replace("'", "")
-    technique = variety_info['Tecnica di Coltivazione'].lower()
-
-    # Feature di base della varietà
-    variety_features = {
-        f'{variety_name}_prod_t_ha': variety_info['Produzione (tonnellate/ettaro)'],
-        f'{variety_name}_oil_prod_t_ha': variety_info['Produzione Olio (tonnellate/ettaro)'],
-        f'{variety_name}_oil_prod_l_ha': variety_info['Produzione Olio (litri/ettaro)'],
-        f'{variety_name}_min_yield_pct': variety_info['Min % Resa'],
-        f'{variety_name}_max_yield_pct': variety_info['Max % Resa'],
-        f'{variety_name}_min_oil_prod_l_ha': variety_info['Min Produzione Olio (litri/ettaro)'],
-        f'{variety_name}_max_oil_prod_l_ha': variety_info['Max Produzione Olio (litri/ettaro)'],
-        f'{variety_name}_avg_oil_prod_l_ha': variety_info['Media Produzione Olio (litri/ettaro)'],
-        f'{variety_name}_l_per_t': variety_info['Litri per Tonnellata'],
-        f'{variety_name}_min_l_per_t': variety_info['Min Litri per Tonnellata'],
-        f'{variety_name}_max_l_per_t': variety_info['Max Litri per Tonnellata'],
-        f'{variety_name}_avg_l_per_t': variety_info['Media Litri per Tonnellata']
-    }
-
-    # Aggiungi le feature binarie per le tecniche di coltivazione
-    for tech in ['tradizionale', 'intensiva', 'superintensiva']:
-        variety_features[f'{variety_name}_{tech}'] = 1 if technique == tech else 0
-
-    # Converti il dizionario in lista mantenendo l'ordine usato durante il training
-    static_features.extend([variety_features[key] for key in sorted(variety_features.keys())])
-
-    return np.array(static_features)
-
 def clean_column_name(name):
     # Rimuove caratteri speciali e spazi, converte in snake_case e abbrevia
     name = re.sub(r'[^a-zA-Z0-9\s]', '', name)  # Rimuove caratteri speciali
@@ -367,52 +322,21 @@ def clean_column_name(name):
     return name
 
 # Funzioni di supporto per la dashboard
-def prepare_prediction_data(weather_data, varieties_info, percentages, hectares):
-    """
-    Prepara i dati per la predizione con multiple varietà.
-
-    Args:
-        weather_data: DataFrame con i dati meteorologici
-        varieties_info: Lista di Series con le informazioni delle varietà selezionate
-        percentages: Lista con le percentuali per ogni varietà
-        hectares: Numero di ettari totali
-    """
-    # Prepara dati temporali
-    monthly_stats = weather_data.groupby(['year', 'month']).agg({
-        'temp': 'mean',
-        'precip': 'sum',
-        'solarradiation': 'sum'
-    }).reset_index()
-
-    temporal_features = ['temp_mean', 'precip_sum', 'solar_energy_sum']
-    temporal_data = monthly_stats.rename(columns={
-        'temp': 'temp_mean',
-        'precip': 'precip_sum',
-        'solarradiation': 'solar_energy_sum'
-    })[temporal_features].values[-41:]  # Ultimi 41 timestep come nel training
-
-    temporal_data = scaler_temporal.transform(temporal_data)
-    temporal_data = np.expand_dims(temporal_data, axis=0)
-
-    # Prepara dati statici per tutte le varietà
-    static_data = prepare_static_features_multiple(varieties_info, percentages, hectares)
-    static_data = np.expand_dims(static_data, axis=0)
-    static_data = scaler_static.transform(static_data)
-
-    return {'temporal': temporal_data, 'static': static_data}
-
-def prepare_static_features_multiple(varieties_info, percentages, hectares):
+def prepare_static_features_multiple(varieties_info, percentages, hectares, all_varieties):
     """
     Prepara le feature statiche per multiple varietà seguendo la struttura esatta della simulazione.
 
     Args:
-        varieties_info: Lista di Series con le informazioni delle varietà selezionate
-        percentages: Lista con le percentuali per ogni varietà
-        hectares: Numero di ettari totali
+    varieties_info (list): Lista di dizionari contenenti le informazioni sulle varietà selezionate
+    percentages (list): Lista delle percentuali corrispondenti a ciascuna varietà selezionata
+    hectares (float): Numero di ettari totali
+    all_varieties (list): Lista di tutte le possibili varietà nel dataset originale
+
+    Returns:
+    np.array: Array numpy contenente tutte le feature statiche
     """
     # Inizializza un dizionario per tutte le varietà possibili
-    variety_data = {clean_column_name(variety): {
-        'tech': '',
+    variety_data = {variety: {
         'pct': 0,
         'prod_t_ha': 0,
         'oil_prod_t_ha': 0,
@@ -426,12 +350,8 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares):
         'min_l_per_t': 0,
         'max_l_per_t': 0,
         'avg_l_per_t': 0,
-        'olive_prod': 0,
-        'min_oil_prod': 0,
-        'max_oil_prod': 0,
-        'avg_oil_prod': 0,
-        'water_need': 0
-    } for variety in olive_varieties['Varietà di Olive'].unique()}
+        'tech': ''
+    } for variety in all_varieties}
 
     # Aggiorna i dati per le varietà selezionate
     for variety_info, percentage in zip(varieties_info, percentages):
@@ -453,7 +373,6 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares):
                           ) / 4 * percentage/100 * hectares
 
         variety_data[variety_name].update({
-            'tech': technique,
             'pct': percentage/100,
             'prod_t_ha': variety_info['Produzione (tonnellate/ettaro)'],
             'oil_prod_t_ha': variety_info['Produzione Olio (tonnellate/ettaro)'],
@@ -467,31 +386,36 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares):
             'min_l_per_t': variety_info['Min Litri per Tonnellata'],
             'max_l_per_t': variety_info['Max Litri per Tonnellata'],
             'avg_l_per_t': variety_info['Media Litri per Tonnellata'],
-            'olive_prod': annual_prod,
-            'min_oil_prod': min_oil_prod,
-            'max_oil_prod': max_oil_prod,
-            'avg_oil_prod': avg_oil_prod,
-            'water_need': base_water_need
+            'tech': technique
         })
 
     # Crea il vettore delle feature nell'ordine esatto
     static_features = [hectares]  # Inizia con gli ettari
 
+    # Lista delle feature per ogni varietà
+    variety_features = ['pct', 'prod_t_ha', 'oil_prod_t_ha', 'oil_prod_l_ha', 'min_yield_pct', 'max_yield_pct',
+                        'min_oil_prod_l_ha', 'max_oil_prod_l_ha', 'avg_oil_prod_l_ha', 'l_per_t', 'min_l_per_t',
+                        'max_l_per_t', 'avg_l_per_t']
+
     # Appiattisci i dati delle varietà mantenendo l'ordine esatto
-    flattened_variety_data = {
-        f'{variety}_{key}': value
-        for variety, data in sorted(variety_data.items())  # Ordina per nome varietà
-        for key, value in sorted(data.items())  # Ordina per nome feature
-    }
+    for variety in all_varieties:
+        # Feature esistenti
+        for feature in variety_features:
+            static_features.append(variety_data[variety][feature])
 
-    # Aggiungi le feature nell'ordine corretto
-    static_features.extend([flattened_variety_data[key] for key in sorted(flattened_variety_data.keys())])
+        # Feature binarie per le tecniche di coltivazione
+        for technique in ['tradizionale', 'intensiva', 'superintensiva']:
+            static_features.append(1 if variety_data[variety]['tech'] == technique else 0)
 
-    return np.array(static_features)
+    print(f"lunghezza features {len(static_features)} ")
+
+    return np.array(static_features).reshape(1, -1)
 
 def make_prediction(weather_data, varieties_info, percentages, hectares):
     """Effettua una predizione usando il modello."""
     try:
+        print("Inizio della funzione make_prediction")
+
         # Prepara i dati meteorologici mensili
         monthly_stats = weather_data.groupby(['year', 'month']).agg({
             'temp': 'mean',
@@ -505,17 +429,42 @@ def make_prediction(weather_data, varieties_info, percentages, hectares):
             'solarradiation': 'solar_energy_sum'
         })
 
-        # Prendi gli ultimi 41 mesi di dati
-        temporal_data = monthly_stats[['temp_mean', 'precip_sum', 'solar_energy_sum']].values[-41:]
+        print(f"Shape dei dati meteorologici mensili: {monthly_stats.shape}")
+
+        # Definisci la dimensione della finestra temporale
+        window_size = 41
+
+        # Prendi gli ultimi window_size mesi di dati
+        if len(monthly_stats) >= window_size:
+            temporal_data = monthly_stats[['temp_mean', 'precip_sum', 'solar_energy_sum']].values[-window_size:]
+        else:
+            raise ValueError(f"Non ci sono abbastanza dati meteorologici. Necessari almeno {window_size} mesi.")
+
+        print(f"Shape dei dati temporali prima della trasformazione: {temporal_data.shape}")
+
         temporal_data = scaler_temporal.transform(temporal_data)
+        print(f"Shape dei dati temporali dopo la trasformazione: {temporal_data.shape}")
+
         temporal_data = np.expand_dims(temporal_data, axis=0)
+        print(f"Shape finale dei dati temporali: {temporal_data.shape}")
+
+        all_varieties = olive_varieties['Varietà di Olive'].unique()
+        varieties = [clean_column_name(variety) for variety in all_varieties]
 
         # Prepara i dati statici
-        static_data = prepare_static_features_multiple(varieties_info, percentages, hectares)
-        static_data = np.expand_dims(static_data, axis=0)
+        print("Preparazione dei dati statici")
+        static_data = prepare_static_features_multiple(varieties_info, percentages, hectares,varieties)
+
+        # Verifica che il numero di feature statiche sia corretto
+        if static_data.shape[1] != scaler_static.n_features_in_:
+            print("ATTENZIONE: Il numero di feature statiche non corrisponde a quello atteso dallo scaler!")
+            print(f"Feature generate: {static_data.shape[1]}, Feature attese: {scaler_static.n_features_in_}")
+
         static_data = scaler_static.transform(static_data)
+        print(f"Shape dei dati statici dopo la trasformazione: {static_data.shape}")
 
         # Effettua la predizione
+        print("Effettuazione della predizione")
         prediction = model.predict({'temporal': temporal_data, 'static': static_data})
         prediction = scaler_y.inverse_transform(prediction)[0]
 
@@ -551,6 +500,10 @@ def make_prediction(weather_data, varieties_info, percentages, hectares):
 
     except Exception as e:
         print(f"Errore durante la preparazione dei dati o la predizione: {str(e)}")
+        print(f"Tipo di errore: {type(e).__name__}")
+        import traceback
+        print("Traceback completo:")
+        print(traceback.format_exc())
         raise e
 
 # Definizione del layout della dashboard
@@ -782,65 +735,6 @@ app.layout = dbc.Container([
         ], width=6)
     ])
 ], fluid=True)
-
-def prepare_static_features_multiple(varieties_info, percentages, hectares):
-    """Prepara le feature statiche per multiple varietà."""
-    static_features = [hectares]  # Inizia con gli ettari totali
-
-    # Dizionario per tenere traccia delle feature per ogni varietà possibile
-    all_varieties = olive_varieties['Varietà di Olive'].unique()
-    variety_features = {}
-
-    # Inizializza tutte le feature a 0 per tutte le varietà possibili
-    for variety in all_varieties:
-        variety_name = variety.lower().replace(" ", "_").replace("'", "")
-        # Feature base
-        variety_features[f'{variety_name}_pct'] = 0
-        variety_features[f'{variety_name}_prod_t_ha'] = 0
-        variety_features[f'{variety_name}_oil_prod_t_ha'] = 0
-        variety_features[f'{variety_name}_oil_prod_l_ha'] = 0
-        variety_features[f'{variety_name}_min_yield_pct'] = 0
-        variety_features[f'{variety_name}_max_yield_pct'] = 0
-        variety_features[f'{variety_name}_min_oil_prod_l_ha'] = 0
-        variety_features[f'{variety_name}_max_oil_prod_l_ha'] = 0
-        variety_features[f'{variety_name}_avg_oil_prod_l_ha'] = 0
-        variety_features[f'{variety_name}_l_per_t'] = 0
-        variety_features[f'{variety_name}_min_l_per_t'] = 0
-        variety_features[f'{variety_name}_max_l_per_t'] = 0
-        variety_features[f'{variety_name}_avg_l_per_t'] = 0
-        # Feature tecniche
-        variety_features[f'{variety_name}_tradizionale'] = 0
-        variety_features[f'{variety_name}_intensiva'] = 0
-        variety_features[f'{variety_name}_superintensiva'] = 0
-
-    # Aggiorna le feature per le varietà selezionate
-    for variety_info, percentage in zip(varieties_info, percentages):
-        if variety_info is not None and percentage > 0:
-            variety_name = variety_info['Varietà di Olive'].lower().replace(" ", "_").replace("'", "")
-            technique = variety_info['Tecnica di Coltivazione'].lower()
-
-            # Aggiorna le feature della varietà
-            variety_features[f'{variety_name}_pct'] = percentage / 100
-            variety_features[f'{variety_name}_prod_t_ha'] = variety_info['Produzione (tonnellate/ettaro)']
-            variety_features[f'{variety_name}_oil_prod_t_ha'] = variety_info['Produzione Olio (tonnellate/ettaro)']
-            variety_features[f'{variety_name}_oil_prod_l_ha'] = variety_info['Produzione Olio (litri/ettaro)']
-            variety_features[f'{variety_name}_min_yield_pct'] = variety_info['Min % Resa']
-            variety_features[f'{variety_name}_max_yield_pct'] = variety_info['Max % Resa']
-            variety_features[f'{variety_name}_min_oil_prod_l_ha'] = variety_info['Min Produzione Olio (litri/ettaro)']
-            variety_features[f'{variety_name}_max_oil_prod_l_ha'] = variety_info['Max Produzione Olio (litri/ettaro)']
-            variety_features[f'{variety_name}_avg_oil_prod_l_ha'] = variety_info['Media Produzione Olio (litri/ettaro)']
-            variety_features[f'{variety_name}_l_per_t'] = variety_info['Litri per Tonnellata']
-            variety_features[f'{variety_name}_min_l_per_t'] = variety_info['Min Litri per Tonnellata']
-            variety_features[f'{variety_name}_max_l_per_t'] = variety_info['Max Litri per Tonnellata']
-            variety_features[f'{variety_name}_avg_l_per_t'] = variety_info['Media Litri per Tonnellata']
-
-            # Aggiorna la tecnica
-            variety_features[f'{variety_name}_{technique}'] = 1
-
-    # Converti il dizionario in lista mantenendo l'ordine
-    static_features.extend([variety_features[key] for key in sorted(variety_features.keys())])
-
-    return np.array(static_features)
 
 # Callback per la gestione delle percentuali e abilitazione dei campi
 @app.callback(
