@@ -2,302 +2,100 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output, State, callback
+from dash import Dash, dcc, html, Input, Output, State, callback, no_update
 import tensorflow as tf
 import joblib
 from sklearn.preprocessing import StandardScaler
 import dash_bootstrap_components as dbc
 from datetime import datetime, timedelta
 import re
+import os
+import json
 
-@tf.keras.utils.register_keras_serializable()
-class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, initial_learning_rate=1e-3, warmup_steps=1000, decay_steps=10000):
-        super().__init__()
-        self.initial_learning_rate = initial_learning_rate
-        self.warmup_steps = warmup_steps
-        self.decay_steps = decay_steps
+DEV_MODE = os.getenv('DEV_MODE', 'True').lower() == 'true'
 
-    def __call__(self, step):
-        warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
-        warmup_lr = self.initial_learning_rate * warmup_pct
-        decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
-        decayed_lr = self.initial_learning_rate * decay_factor
-        final_lr = tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
-        return final_lr
+CONFIG_FILE = 'olive_config.json'
 
-    def get_config(self):
-        return {
-            'initial_learning_rate': self.initial_learning_rate,
-            'warmup_steps': self.warmup_steps,
-            'decay_steps': self.decay_steps
+
+def load_config():
+    default_config = {
+        'oliveto': {
+            'hectares': 1,
+            'varieties': [
+                {
+                    'variety': olive_varieties['Varietà di Olive'].iloc[0],
+                    'technique': 'Tradizionale',
+                    'percentage': 100
+                }
+            ]
+        },
+        'costs': {
+            'fixed': {
+                'ammortamento': 2000,
+                'assicurazione': 500,
+                'manutenzione': 800
+            },
+            'variable': {
+                'raccolta': 0.35,
+                'potatura': 600,
+                'fertilizzanti': 400
+            },
+            'transformation': {
+                'molitura': 0.15,
+                'stoccaggio': 0.20,
+                'bottiglia': 1.20,
+                'etichettatura': 0.30
+            },
+            'selling_price': 12.00
         }
+    }
 
-# Definizione delle classi del modello
-class PositionalEncoding(tf.keras.layers.Layer):
-    def __init__(self, position, d_model):
-        super(PositionalEncoding, self).__init__()
-        self.pos_encoding = self.positional_encoding(position, d_model)
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        return default_config
+    except Exception as e:
+        print(f"Errore nel caricamento della configurazione: {e}")
+        return default_config
 
-    def get_angles(self, position, i, d_model):
-        angles = 1 / tf.pow(10000, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
-        return position * angles
 
-    def positional_encoding(self, position, d_model):
-        angle_rads = self.get_angles(
-            position=tf.range(position, dtype=tf.float32)[:, tf.newaxis],
-            i=tf.range(d_model, dtype=tf.float32)[tf.newaxis, :],
-            d_model=d_model)
+# Funzione per salvare la configurazione
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+        return True
+    except Exception as e:
+        print(f"Errore nel salvataggio della configurazione: {e}")
+        return False
 
-        sines = tf.math.sin(angle_rads[:, 0::2])
-        cosines = tf.math.cos(angle_rads[:, 1::2])
 
-        pos_encoding = tf.concat([sines, cosines], axis=-1)
-        pos_encoding = pos_encoding[tf.newaxis, ...]
-        return tf.cast(pos_encoding, tf.float32)
+# Caricamento dati
+print("Inizializzazione della dashboard...")
 
-    def call(self, inputs):
-        return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
+try:
+    # Caricamento dati e modello
+    print("Caricamento dati...")
+    simulated_data = pd.read_parquet("./data/simulated_data.parquet")
+    weather_data = pd.read_parquet("./data/weather_data_complete.parquet")
+    olive_varieties = pd.read_parquet("./data/olive_varieties.parquet")
+    if not DEV_MODE:
 
-class TemporalAugmentation(tf.keras.layers.Layer):
-    def __init__(self, noise_factor=0.03, **kwargs):
-        super().__init__(**kwargs)
-        self.noise_factor = noise_factor
+        print("Caricamento modello e scaler...")
+        model = tf.keras.models.load_model('./models/oli_transformer/olive_transformer.keras')
 
-    def call(self, inputs, training=None):
-        if training:
-            noise = tf.random.normal(
-                shape=tf.shape(inputs),
-                mean=0.0,
-                stddev=self.noise_factor
-            )
-            return inputs + noise
-        return inputs
+        scaler_temporal = joblib.load('./models/oli_transformer/scaler_temporal.joblib')
+        scaler_static = joblib.load('./models/oli_transformer/scaler_static.joblib')
+        scaler_y = joblib.load('./models/oli_transformer/scaler_y.joblib')
 
-class EnhancedTransformerBlock(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1):
-        super().__init__()
-        self.att = tf.keras.layers.MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=d_model // num_heads,
-            value_dim=d_model // num_heads
-        )
-        self.ffn = tf.keras.Sequential([
-            tf.keras.layers.Dense(ff_dim, activation="gelu"),
-            tf.keras.layers.Dropout(dropout),
-            tf.keras.layers.Dense(d_model)
-        ])
-        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.dropout1 = tf.keras.layers.Dropout(dropout)
-        self.dropout2 = tf.keras.layers.Dropout(dropout)
-        self.residual_attention = tf.keras.layers.Dense(d_model, activation='sigmoid')
+    else:
+        print("Modalità sviluppo attiva - Modelli non caricati")
 
-    def call(self, inputs, training):
-        attn_output = self.att(inputs, inputs)
-        attn_output = self.dropout1(attn_output, training=training)
-        residual_weights = self.residual_attention(inputs)
-        out1 = self.layernorm1(inputs + residual_weights * attn_output)
+except Exception as e:
+    print(f"Errore nel caricamento: {str(e)}")
+    raise e
 
-        ffn_output = self.ffn(out1)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        return self.layernorm2(out1 + ffn_output)
-
-class TemporalPoolingLayer(tf.keras.layers.Layer):
-    def __init__(self, num_heads, key_dim, **kwargs):
-        super().__init__(**kwargs)
-        self.attention_pooling = tf.keras.layers.MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=key_dim
-        )
-        self.temporal_pooling = tf.keras.layers.GlobalAveragePooling1D()
-        self.max_pooling = tf.keras.layers.GlobalMaxPooling1D()
-        self.concat = tf.keras.layers.Concatenate(axis=-1)
-
-    def call(self, inputs, training=None):
-        att_output = self.attention_pooling(inputs, inputs)
-        avg_output = self.temporal_pooling(inputs)
-        max_output = self.max_pooling(inputs)
-        att_output = tf.reduce_mean(att_output, axis=1)
-        return self.concat([att_output, avg_output, max_output])
-
-@tf.keras.utils.register_keras_serializable()
-class OliveOilTransformer(tf.keras.Model):
-    def __init__(self, temporal_shape=None, static_shape=None, num_outputs=None,
-                 d_model=128, num_heads=8, ff_dim=256, num_transformer_blocks=4,
-                 mlp_units=[256, 128, 64], dropout=0.2, **kwargs):
-        super(OliveOilTransformer, self).__init__(**kwargs)
-
-        self.temporal_shape = temporal_shape
-        self.static_shape = static_shape
-        self.num_outputs = num_outputs
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.ff_dim = ff_dim
-        self.num_transformer_blocks = num_transformer_blocks
-        self.mlp_units = mlp_units
-        self.dropout_rate = dropout
-
-        if temporal_shape is not None and static_shape is not None and num_outputs is not None:
-            self.build_model()
-
-    def build_model(self):
-        # Input layers
-        self.temporal_input = tf.keras.layers.Input(shape=self.temporal_shape, name='temporal_input')
-        self.static_input = tf.keras.layers.Input(shape=self.static_shape, name='static_input')
-
-        # Input normalization
-        self.temporal_normalization = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.static_normalization = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-
-        # Data Augmentation
-        self.temporal_augmentation = TemporalAugmentation(noise_factor=0.03)
-
-        # Temporal path
-        self.temporal_projection = tf.keras.Sequential([
-            tf.keras.layers.Dense(self.d_model//2, activation='gelu',
-                                  kernel_regularizer=tf.keras.regularizers.l2(1e-5)),
-            tf.keras.layers.Dropout(self.dropout_rate),
-            tf.keras.layers.Dense(self.d_model, activation='gelu',
-                                  kernel_regularizer=tf.keras.regularizers.l2(1e-5))
-        ])
-
-        self.pos_encoding = PositionalEncoding(position=self.temporal_shape[0], d_model=self.d_model)
-
-        # Transformer blocks
-        self.transformer_blocks = [
-            EnhancedTransformerBlock(self.d_model, self.num_heads, self.ff_dim, self.dropout_rate)
-            for _ in range(self.num_transformer_blocks)
-        ]
-
-        # Temporal pooling
-        self.temporal_pooling = TemporalPoolingLayer(
-            num_heads=self.num_heads,
-            key_dim=self.d_model//4
-        )
-
-        # Static path
-        self.static_encoder = tf.keras.Sequential([
-            tf.keras.layers.Dense(256, activation='gelu',
-                                  kernel_regularizer=tf.keras.regularizers.l2(1e-5)),
-            tf.keras.layers.Dropout(self.dropout_rate),
-            tf.keras.layers.Dense(128, activation='gelu',
-                                  kernel_regularizer=tf.keras.regularizers.l2(1e-5)),
-            tf.keras.layers.Dropout(self.dropout_rate),
-            tf.keras.layers.Dense(64, activation='gelu',
-                                  kernel_regularizer=tf.keras.regularizers.l2(1e-5))
-        ])
-
-        # Feature fusion
-        self.fusion_layer = tf.keras.layers.Concatenate()
-
-        # MLP head
-        self.mlp_layers = []
-        for units in self.mlp_units:
-            self.mlp_layers.extend([
-                tf.keras.layers.BatchNormalization(),
-                tf.keras.layers.Dense(units, activation="gelu",
-                                      kernel_regularizer=tf.keras.regularizers.l2(1e-5)),
-                tf.keras.layers.Dropout(self.dropout_rate)
-            ])
-
-        # Output layer
-        self.final_layer = tf.keras.layers.Dense(
-            self.num_outputs,
-            activation='linear',
-            kernel_regularizer=tf.keras.regularizers.l2(1e-5)
-        )
-
-        # Build model
-        temporal_encoded = self.encode_temporal(self.temporal_input, training=True)
-        static_encoded = self.encode_static(self.static_input)
-        combined = self.fusion_layer([temporal_encoded, static_encoded])
-
-        x = combined
-        for layer in self.mlp_layers:
-            x = layer(x)
-
-        outputs = self.final_layer(x)
-
-        self._model = tf.keras.Model(
-            inputs={'temporal': self.temporal_input, 'static': self.static_input},
-            outputs=outputs
-        )
-
-    def encode_temporal(self, x, training=None):
-        x = self.temporal_normalization(x)
-        x = self.temporal_augmentation(x, training=training)
-        x = self.temporal_projection(x)
-        x = self.pos_encoding(x)
-
-        skip_connection = x
-        for transformer in self.transformer_blocks:
-            x = transformer(x, training=training)
-        x = tf.keras.layers.Add()([x, skip_connection])
-
-        return self.temporal_pooling(x)
-
-    def encode_static(self, x):
-        x = self.static_normalization(x)
-        return self.static_encoder(x)
-
-    def call(self, inputs, training=None):
-        temporal_input = inputs['temporal']
-        static_input = inputs['static']
-
-        temporal_encoded = self.encode_temporal(temporal_input, training)
-        static_encoded = self.encode_static(static_input)
-
-        combined = self.fusion_layer([temporal_encoded, static_encoded])
-
-        x = combined
-        for layer in self.mlp_layers:
-            x = layer(x, training=training)
-
-        return self.final_layer(x)
-
-    def model(self):
-        return self._model
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "temporal_shape": self.temporal_shape,
-            "static_shape": self.static_shape,
-            "num_outputs": self.num_outputs,
-            "d_model": self.d_model,
-            "num_heads": self.num_heads,
-            "ff_dim": self.ff_dim,
-            "num_transformer_blocks": self.num_transformer_blocks,
-            "mlp_units": self.mlp_units,
-            "dropout": self.dropout_rate
-        })
-        return config
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
-# Caricamento dati e modello
-print("Caricamento dati...")
-simulated_data = pd.read_parquet("./data/simulated_data.parquet")
-weather_data = pd.read_parquet("./data/weather_data_complete.parquet")
-olive_varieties = pd.read_parquet("./data/olive_varieties.parquet")
-
-print("Caricamento modello e scaler...")
-model = tf.keras.models.load_model('./models/oli_transformer/olive_transformer.keras',
-                                   custom_objects={
-                                       'OliveOilTransformer': OliveOilTransformer,
-                                       'PositionalEncoding': PositionalEncoding,
-                                       'TemporalAugmentation': TemporalAugmentation,
-                                       'EnhancedTransformerBlock': EnhancedTransformerBlock,
-                                       'TemporalPoolingLayer': TemporalPoolingLayer,
-                                       'WarmUpLearningRateSchedule': WarmUpLearningRateSchedule
-                                   })
-
-scaler_temporal = joblib.load('./models/oli_transformer/scaler_temporal.joblib')
-scaler_static = joblib.load('./models/oli_transformer/scaler_static.joblib')
-scaler_y = joblib.load('./models/oli_transformer/scaler_y.joblib')
 
 def clean_column_name(name):
     # Rimuove caratteri speciali e spazi, converte in snake_case e abbrevia
@@ -320,6 +118,7 @@ def clean_column_name(name):
         name = name.replace(full, abbr)
 
     return name
+
 
 # Funzioni di supporto per la dashboard
 def prepare_static_features_multiple(varieties_info, percentages, hectares, all_varieties):
@@ -359,7 +158,7 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares, all_
         technique = clean_column_name(variety_info['Tecnica di Coltivazione'])
 
         # Base production calculations
-        annual_prod = variety_info['Produzione (tonnellate/ettaro)'] * 1000 * percentage/100 * hectares
+        annual_prod = variety_info['Produzione (tonnellate/ettaro)'] * 1000 * percentage / 100 * hectares
         min_oil_prod = annual_prod * variety_info['Min Litri per Tonnellata'] / 1000
         max_oil_prod = annual_prod * variety_info['Max Litri per Tonnellata'] / 1000
         avg_oil_prod = annual_prod * variety_info['Media Litri per Tonnellata'] / 1000
@@ -370,10 +169,10 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares, all_
                                   variety_info['Fabbisogno Acqua Estate (m³/ettaro)'] +
                                   variety_info['Fabbisogno Acqua Autunno (m³/ettaro)'] +
                                   variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']
-                          ) / 4 * percentage/100 * hectares
+                          ) / 4 * percentage / 100 * hectares
 
         variety_data[variety_name].update({
-            'pct': percentage/100,
+            'pct': percentage / 100,
             'prod_t_ha': variety_info['Produzione (tonnellate/ettaro)'],
             'oil_prod_t_ha': variety_info['Produzione Olio (tonnellate/ettaro)'],
             'oil_prod_l_ha': variety_info['Produzione Olio (litri/ettaro)'],
@@ -411,365 +210,1153 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares, all_
 
     return np.array(static_features).reshape(1, -1)
 
-def make_prediction(weather_data, varieties_info, percentages, hectares):
-    """Effettua una predizione usando il modello."""
+
+def mock_make_prediction(weather_data, varieties_info, percentages, hectares):
+    """
+    Versione mock della funzione make_prediction che simula risultati realistici
+    basati sui dati reali delle varietà e tiene conto degli ettari
+    """
     try:
-        print("Inizio della funzione make_prediction")
+        # Calcola la produzione di olive basata sui dati reali delle varietà per ettaro
+        olive_production_per_ha = sum(
+            variety_info['Produzione (tonnellate/ettaro)'] * 1000 * (percentage / 100)
+            for variety_info, percentage in zip(varieties_info, percentages)
+        )
 
-        # Prepara i dati meteorologici mensili
-        monthly_stats = weather_data.groupby(['year', 'month']).agg({
-            'temp': 'mean',
-            'precip': 'sum',
-            'solarradiation': 'sum'
-        }).reset_index()
+        # Applica il fattore ettari
+        olive_production = olive_production_per_ha * hectares
 
-        monthly_stats = monthly_stats.rename(columns={
-            'temp': 'temp_mean',
-            'precip': 'precip_sum',
-            'solarradiation': 'solar_energy_sum'
-        })
+        # Aggiungi una variabilità realistica basata sulle condizioni meteorologiche recenti
+        recent_weather = weather_data.tail(3)
+        weather_factor = 1.0
 
-        print(f"Shape dei dati meteorologici mensili: {monthly_stats.shape}")
+        # Temperatura influenza la produzione
+        avg_temp = recent_weather['temp'].mean()
+        if avg_temp < 15:
+            weather_factor *= 0.9
+        elif avg_temp > 25:
+            weather_factor *= 0.95
 
-        # Definisci la dimensione della finestra temporale
-        window_size = 41
+        # Precipitazioni influenzano la produzione
+        total_precip = recent_weather['precip'].sum()
+        if total_precip < 30:  # Siccità
+            weather_factor *= 0.85
+        elif total_precip > 200:  # Troppa pioggia
+            weather_factor *= 0.9
 
-        # Prendi gli ultimi window_size mesi di dati
-        if len(monthly_stats) >= window_size:
-            temporal_data = monthly_stats[['temp_mean', 'precip_sum', 'solar_energy_sum']].values[-window_size:]
-        else:
-            raise ValueError(f"Non ci sono abbastanza dati meteorologici. Necessari almeno {window_size} mesi.")
+        # Radiazione solare influenza la produzione
+        avg_solar = recent_weather['solarradiation'].mean()
+        if avg_solar < 150:
+            weather_factor *= 0.95
 
-        print(f"Shape dei dati temporali prima della trasformazione: {temporal_data.shape}")
+        # Applica il fattore meteorologico alla produzione totale
+        olive_production = olive_production * weather_factor
 
-        temporal_data = scaler_temporal.transform(temporal_data)
-        print(f"Shape dei dati temporali dopo la trasformazione: {temporal_data.shape}")
+        # Calcola la produzione di olio basata sulle rese delle varietà
+        oil_per_ha = 0
+        oil_total = 0
 
-        temporal_data = np.expand_dims(temporal_data, axis=0)
-        print(f"Shape finale dei dati temporali: {temporal_data.shape}")
+        for variety_info, percentage in zip(varieties_info, percentages):
+            # Calcolo della produzione di olio per ettaro per questa varietà
+            variety_oil_per_ha = variety_info['Produzione Olio (litri/ettaro)'] * (percentage / 100)
+            oil_per_ha += variety_oil_per_ha
 
-        all_varieties = olive_varieties['Varietà di Olive'].unique()
-        varieties = [clean_column_name(variety) for variety in all_varieties]
+            # Calcolo della produzione totale di olio per questa varietà
+            variety_oil_total = variety_oil_per_ha * hectares
+            oil_total += variety_oil_total
 
-        # Prepara i dati statici
-        print("Preparazione dei dati statici")
-        static_data = prepare_static_features_multiple(varieties_info, percentages, hectares,varieties)
+        # Applica il fattore meteorologico anche alla produzione di olio
+        oil_total = oil_total * weather_factor
+        oil_per_ha = oil_per_ha * weather_factor
 
-        # Verifica che il numero di feature statiche sia corretto
-        if static_data.shape[1] != scaler_static.n_features_in_:
-            print("ATTENZIONE: Il numero di feature statiche non corrisponde a quello atteso dallo scaler!")
-            print(f"Feature generate: {static_data.shape[1]}, Feature attese: {scaler_static.n_features_in_}")
+        # Calcola il fabbisogno idrico considerando la stagione attuale e gli ettari
+        current_month = datetime.now().month
+        seasons = {
+            'Primavera': [3, 4, 5],
+            'Estate': [6, 7, 8],
+            'Autunno': [9, 10, 11],
+            'Inverno': [12, 1, 2]
+        }
 
-        static_data = scaler_static.transform(static_data)
-        print(f"Shape dei dati statici dopo la trasformazione: {static_data.shape}")
+        current_season = next(season for season, months in seasons.items()
+                              if current_month in months)
 
-        # Effettua la predizione
-        print("Effettuazione della predizione")
-        prediction = model.predict({'temporal': temporal_data, 'static': static_data})
-        prediction = scaler_y.inverse_transform(prediction)[0]
+        season_water_need = {
+            'Primavera': 'Fabbisogno Acqua Primavera (m³/ettaro)',
+            'Estate': 'Fabbisogno Acqua Estate (m³/ettaro)',
+            'Autunno': 'Fabbisogno Acqua Autunno (m³/ettaro)',
+            'Inverno': 'Fabbisogno Acqua Inverno (m³/ettaro)'
+        }
 
-        # Calcola i dettagli per varietà
+        # Calcolo del fabbisogno idrico per ettaro
+        water_need_per_ha = sum(
+            variety_info[season_water_need[current_season]] * (percentage / 100)
+            for variety_info, percentage in zip(varieties_info, percentages)
+        )
+
+        # Applica il fattore ettari al fabbisogno idrico
+        total_water_need = water_need_per_ha * hectares
+
+        # Prepara i dettagli per varietà
         variety_details = []
         for variety_info, percentage in zip(varieties_info, percentages):
-            # Calcoli specifici per varietà
-            prod_per_ha = variety_info['Produzione (tonnellate/ettaro)'] * 1000
-            oil_per_ha = variety_info['Produzione Olio (litri/ettaro)']
-            water_need = (
-                                 variety_info['Fabbisogno Acqua Primavera (m³/ettaro)'] +
-                                 variety_info['Fabbisogno Acqua Estate (m³/ettaro)'] +
-                                 variety_info['Fabbisogno Acqua Autunno (m³/ettaro)'] +
-                                 variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']
-                         ) / 4
+            variety_prod_per_ha = variety_info['Produzione (tonnellate/ettaro)'] * 1000 * (percentage / 100)
+            variety_prod_total = variety_prod_per_ha * hectares * weather_factor
+
+            # Calcolo corretto dell'olio per varietà
+            variety_oil_per_ha = variety_info['Produzione Olio (litri/ettaro)'] * (percentage / 100)
+            variety_oil_total = variety_oil_per_ha * hectares * weather_factor
 
             variety_details.append({
                 'variety': variety_info['Varietà di Olive'],
                 'percentage': percentage,
-                'production_per_ha': prod_per_ha,
-                'oil_per_ha': oil_per_ha,
-                'water_need': water_need
+                'production_per_ha': variety_prod_per_ha,
+                'production_total': variety_prod_total,
+                'oil_per_ha': variety_oil_per_ha,
+                'oil_total': variety_oil_total,
+                'water_need': variety_info[season_water_need[current_season]] * hectares
             })
 
         return {
-            'olive_production': prediction[0],
-            'min_oil_production': prediction[1],
-            'max_oil_production': prediction[2],
-            'avg_oil_production': prediction[3],
-            'water_need': prediction[4],
-            'variety_details': variety_details
+            'olive_production': olive_production_per_ha,
+            'olive_production_total': olive_production,
+            'min_oil_production': oil_per_ha * 0.9,
+            'max_oil_production': oil_per_ha * 1.1,
+            'avg_oil_production': oil_per_ha,
+            'avg_oil_production_total': oil_total,
+            'water_need': water_need_per_ha,
+            'water_need_total': total_water_need,
+            'variety_details': variety_details,
+            'hectares': hectares
         }
 
     except Exception as e:
-        print(f"Errore durante la preparazione dei dati o la predizione: {str(e)}")
-        print(f"Tipo di errore: {type(e).__name__}")
+        print(f"Errore nella funzione mock_make_prediction: {str(e)}")
         import traceback
         print("Traceback completo:")
         print(traceback.format_exc())
         raise e
 
-# Definizione del layout della dashboard
-app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
-# Layout della dashboard
-variety_options = [
-    {'label': v, 'value': v}
-    for v in sorted(olive_varieties['Varietà di Olive'].unique())
-]
-technique_options = [
-    {'label': t, 'value': t}
-    for t in sorted(olive_varieties['Tecnica di Coltivazione'].unique())
-]
+def make_prediction(weather_data, varieties_info, percentages, hectares):
+    if DEV_MODE:
+        return mock_make_prediction(weather_data, varieties_info, percentages, hectares)
+    else:
+        """Effettua una predizione usando il modello."""
+        try:
+            print("Inizio della funzione make_prediction")
 
-# Layout della dashboard aggiornato
+            # Prepara i dati meteorologici mensili
+            monthly_stats = weather_data.groupby(['year', 'month']).agg({
+                'temp': 'mean',
+                'precip': 'sum',
+                'solarradiation': 'sum'
+            }).reset_index()
+
+            monthly_stats = monthly_stats.rename(columns={
+                'temp': 'temp_mean',
+                'precip': 'precip_sum',
+                'solarradiation': 'solar_energy_sum'
+            })
+
+            print(f"Shape dei dati meteorologici mensili: {monthly_stats.shape}")
+
+            # Definisci la dimensione della finestra temporale
+            window_size = 41
+
+            # Prendi gli ultimi window_size mesi di dati
+            if len(monthly_stats) >= window_size:
+                temporal_data = monthly_stats[['temp_mean', 'precip_sum', 'solar_energy_sum']].values[-window_size:]
+            else:
+                raise ValueError(f"Non ci sono abbastanza dati meteorologici. Necessari almeno {window_size} mesi.")
+
+            print(f"Shape dei dati temporali prima della trasformazione: {temporal_data.shape}")
+
+            temporal_data = scaler_temporal.transform(temporal_data)
+            print(f"Shape dei dati temporali dopo la trasformazione: {temporal_data.shape}")
+
+            temporal_data = np.expand_dims(temporal_data, axis=0)
+            print(f"Shape finale dei dati temporali: {temporal_data.shape}")
+
+            all_varieties = olive_varieties['Varietà di Olive'].unique()
+            varieties = [clean_column_name(variety) for variety in all_varieties]
+
+            # Prepara i dati statici
+            print("Preparazione dei dati statici")
+            static_data = prepare_static_features_multiple(varieties_info, percentages, hectares, varieties)
+
+            # Verifica che il numero di feature statiche sia corretto
+            if static_data.shape[1] != scaler_static.n_features_in_:
+                print("ATTENZIONE: Il numero di feature statiche non corrisponde a quello atteso dallo scaler!")
+                print(f"Feature generate: {static_data.shape[1]}, Feature attese: {scaler_static.n_features_in_}")
+
+            static_data = scaler_static.transform(static_data)
+            print(f"Shape dei dati statici dopo la trasformazione: {static_data.shape}")
+
+            # Effettua la predizione
+            print("Effettuazione della predizione")
+            prediction = model.predict({'temporal': temporal_data, 'static': static_data})
+            prediction = scaler_y.inverse_transform(prediction)[0]
+
+            # Calcola i dettagli per varietà
+            variety_details = []
+            for variety_info, percentage in zip(varieties_info, percentages):
+                # Calcoli specifici per varietà
+                prod_per_ha = variety_info['Produzione (tonnellate/ettaro)'] * 1000
+                oil_per_ha = variety_info['Produzione Olio (litri/ettaro)']
+                water_need = (
+                                     variety_info['Fabbisogno Acqua Primavera (m³/ettaro)'] +
+                                     variety_info['Fabbisogno Acqua Estate (m³/ettaro)'] +
+                                     variety_info['Fabbisogno Acqua Autunno (m³/ettaro)'] +
+                                     variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']
+                             ) / 4
+
+                variety_details.append({
+                    'variety': variety_info['Varietà di Olive'],
+                    'percentage': percentage,
+                    'production_per_ha': prod_per_ha,
+                    'oil_per_ha': oil_per_ha,
+                    'water_need': water_need
+                })
+
+            return {
+                'olive_production': prediction[0],
+                'min_oil_production': prediction[1],
+                'max_oil_production': prediction[2],
+                'avg_oil_production': prediction[3],
+                'water_need': prediction[4],
+                'variety_details': variety_details
+            }
+
+        except Exception as e:
+            print(f"Errore durante la preparazione dei dati o la predizione: {str(e)}")
+            print(f"Tipo di errore: {type(e).__name__}")
+            import traceback
+            print("Traceback completo:")
+            print(traceback.format_exc())
+            raise e
+
+
+app = Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.FLATLY],
+    meta_tags=[
+        {"name": "viewport", "content": "width=device-width, initial-scale=1"}
+    ]
+)
+
+# Stili comuni
+CARD_STYLE = {
+    "height": "100%",
+    "margin-bottom": "15px"
+}
+
+CARD_BODY_STYLE = {
+    "padding": "15px"
+}
+
+# Modifiche al layout - aggiungi tooltips per chiarire la funzionalità
+variety2_tooltip = dbc.Tooltip(
+    "Seleziona una seconda varietà per creare un mix",
+    target="variety-2-dropdown",
+    placement="top"
+)
+
+variety3_tooltip = dbc.Tooltip(
+    "Seleziona una terza varietà per completare il mix",
+    target="variety-3-dropdown",
+    placement="top"
+)
+
+# Layout della dashboard modernizzato e responsive
 app.layout = dbc.Container([
+
+    variety2_tooltip,
+    variety3_tooltip,
+    # Header
     dbc.Row([
         dbc.Col([
-            html.H1("Dashboard Produzione Olio d'Oliva", className="text-center mb-4")
+            html.Div([
+                html.H1("Dashboard Produzione Olio d'Oliva",
+                        className="text-primary text-center mb-3"),
+                html.P("Analisi e previsioni della produzione olivicola",
+                       className="text-muted text-center")
+            ], className="mt-4 mb-4")
         ])
     ]),
 
+    # Main content
     dbc.Row([
         dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Composizione Oliveto"),
-                dbc.CardBody([
-                    # Prima varietà (obbligatoria)
-                    html.Div([
-                        html.H6("Varietà 1"),
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Seleziona Varietà:"),
-                                dcc.Dropdown(
-                                    id='variety-1-dropdown',
-                                    options=[{'label': v, 'value': v} for v in olive_varieties['Varietà di Olive'].unique()],
-                                    value=olive_varieties['Varietà di Olive'].iloc[0]
-                                ),
-                            ], width=6),
-                            dbc.Col([
-                                html.Label("Tecnica:"),
-                                dcc.Dropdown(
-                                    id='technique-1-dropdown',
-                                    options=[
-                                        {'label': 'Tradizionale', 'value': 'Tradizionale'},
-                                        {'label': 'Intensiva', 'value': 'Intensiva'},
-                                        {'label': 'Superintensiva', 'value': 'Superintensiva'}
-                                    ],
-                                    value='Tradizionale'
-                                ),
-                            ], width=6)
-                        ]),
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Percentuale (%):"),
-                                dcc.Input(
-                                    id='percentage-1-input',
-                                    type='number',
-                                    min=1,
-                                    max=100,
-                                    value=100,
-                                    className="form-control"
-                                )
-                            ], width=6)
-                        ], className="mt-2")
-                    ], className="mb-3"),
+            dbc.Tabs([
+                dbc.Tab([
+                    # Metriche principali
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Produzione Olive/ha"),
+                                dbc.CardBody([
+                                    html.H3(
+                                        id='olive-production_ha',
+                                        className="text-center text-primary"
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=4),
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Produzione Olio/ha"),
+                                dbc.CardBody([
+                                    html.H3(
+                                        id='oil-production_ha',
+                                        className="text-center text-success"
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=4),
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Fabbisogno Idrico/ha"),
+                                dbc.CardBody([
+                                    html.H3(
+                                        id='water-need_ha',
+                                        className="text-center text-info"
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=4),
+                    ]),
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Produzione Olive"),
+                                dbc.CardBody([
+                                    html.H3(
+                                        id='olive-production',
+                                        className="text-center text-primary"
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=4),
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Produzione Olio"),
+                                dbc.CardBody([
+                                    html.H3(
+                                        id='oil-production',
+                                        className="text-center text-success"
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=4),
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Fabbisogno Idrico"),
+                                dbc.CardBody([
+                                    html.H3(
+                                        id='water-need',
+                                        className="text-center text-info"
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=4),
+                    ]),
 
-                    # Seconda varietà (opzionale)
-                    html.Div([
-                        html.H6("Varietà 2 (opzionale)"),
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Seleziona Varietà:"),
-                                dcc.Dropdown(
-                                    id='variety-2-dropdown',
-                                    options=[{'label': v, 'value': v} for v in olive_varieties['Varietà di Olive'].unique()],
-                                    value=None
-                                ),
-                            ], width=6),
-                            dbc.Col([
-                                html.Label("Tecnica:"),
-                                dcc.Dropdown(
-                                    id='technique-2-dropdown',
-                                    options=[
-                                        {'label': 'Tradizionale', 'value': 'Tradizionale'},
-                                        {'label': 'Intensiva', 'value': 'Intensiva'},
-                                        {'label': 'Superintensiva', 'value': 'Superintensiva'}
-                                    ],
-                                    value=None,
-                                    disabled=True
-                                ),
-                            ], width=6)
-                        ]),
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Percentuale (%):"),
-                                dcc.Input(
-                                    id='percentage-2-input',
-                                    type='number',
-                                    min=0,
-                                    max=99,
-                                    value=0,
-                                    disabled=True,
-                                    className="form-control"
-                                )
-                            ], width=6)
-                        ], className="mt-2")
-                    ], className="mb-3"),
-
-                    # Terza varietà (opzionale)
-                    html.Div([
-                        html.H6("Varietà 3 (opzionale)"),
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Seleziona Varietà:"),
-                                dcc.Dropdown(
-                                    id='variety-3-dropdown',
-                                    options=[{'label': v, 'value': v} for v in olive_varieties['Varietà di Olive'].unique()],
-                                    value=None
-                                ),
-                            ], width=6),
-                            dbc.Col([
-                                html.Label("Tecnica:"),
-                                dcc.Dropdown(
-                                    id='technique-3-dropdown',
-                                    options=[
-                                        {'label': 'Tradizionale', 'value': 'Tradizionale'},
-                                        {'label': 'Intensiva', 'value': 'Intensiva'},
-                                        {'label': 'Superintensiva', 'value': 'Superintensiva'}
-                                    ],
-                                    value=None,
-                                    disabled=True
-                                ),
-                            ], width=6)
-                        ]),
-                        dbc.Row([
-                            dbc.Col([
-                                html.Label("Percentuale (%):"),
-                                dcc.Input(
-                                    id='percentage-3-input',
-                                    type='number',
-                                    min=0,
-                                    max=99,
-                                    value=0,
-                                    disabled=True,
-                                    className="form-control"
-                                )
-                            ], width=6)
-                        ], className="mt-2")
-                    ], className="mb-3"),
-
-                    html.Div(id='percentage-warning', className="text-danger"),
+                    # Grafici
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Dettagli Produzione"),
+                                dbc.CardBody([
+                                    dcc.Graph(
+                                        id='production-details',
+                                        config={'displayModeBar': False}
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=12)
+                    ]),
 
                     dbc.Row([
                         dbc.Col([
-                            html.Label("Ettari totali:"),
-                            dcc.Input(
-                                id='hectares-input',
-                                type='number',
-                                value=5,
-                                min=1,
-                                max=100,
-                                className="form-control"
+                            dbc.Card([
+                                dbc.CardHeader("Analisi Meteorologica"),
+                                dbc.CardBody([
+                                    dcc.Graph(
+                                        id='weather-impact',
+                                        config={'displayModeBar': False}
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=6),
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Fabbisogno Idrico Mensile"),
+                                dbc.CardBody([
+                                    dcc.Graph(
+                                        id='water-needs',
+                                        config={'displayModeBar': False}
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=6)
+                    ]),
+
+                    # Info dettagliate
+                    dbc.Row([
+                        dbc.Col([
+                            html.Div(
+                                id='extra-info',
+                                className="mt-3"
                             )
-                        ], width=6)
-                    ], className="mt-3")
-                ])
-            ], className="mb-4")
-        ], width=4),
-
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Previsioni di Produzione"),
-                dbc.CardBody([
-                    dbc.Row([
-                        dbc.Col([
-                            html.H4("Produzione Olive", className="text-center"),
-                            html.H2(id='olive-production', className="text-center text-primary")
-                        ], width=6),
-                        dbc.Col([
-                            html.H4("Produzione Olio", className="text-center"),
-                            html.H2(id='oil-production', className="text-center text-success")
-                        ], width=6)
-                    ]),
-                    dbc.Row([
-                        dbc.Col([
-                            html.H4("Fabbisogno Idrico", className="text-center mt-4"),
-                            html.H2(id='water-need', className="text-center text-info")
-                        ])
-                    ]),
-                    dbc.Row([
-                        dbc.Col([
-                            html.Div(id='extra-info', className="text-center mt-4")
                         ])
                     ])
-                ])
-            ], className="mb-4")
-        ], width=8)
-    ]),
+                ], label="Produzione", tab_id="tab-production"),
 
-    dbc.Row([
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Dettagli Produzione"),
-                dbc.CardBody([
-                    dcc.Graph(id='production-details')
-                ])
-            ])
-        ], width=12, className="mb-4")
-    ]),
+                dbc.Tab([
+                    # Sezione Costi
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Costi di Produzione"),
+                                dbc.CardBody([
+                                    dbc.Row([
+                                        dbc.Col([
+                                            html.H5("Costi Fissi Annuali", className="mb-3"),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Ammortamento impianto: "),
+                                                    "€2,000.00/ha"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Assicurazione: "),
+                                                    "€500.00/ha"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Manutenzione: "),
+                                                    "€800.00/ha"
+                                                ])
+                                            ], flush=True)
+                                        ], md=6),
+                                        dbc.Col([
+                                            html.H5("Costi Variabili", className="mb-3"),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Manodopera raccolta: "),
+                                                    "€0.35/kg olive"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Potatura: "),
+                                                    "€600.00/ha"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Fertilizzanti: "),
+                                                    "€400.00/ha"
+                                                ])
+                                            ], flush=True)
+                                        ], md=6)
+                                    ])
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=12)
+                    ]),
 
-    dbc.Row([
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Analisi Meteorologica"),
-                dbc.CardBody([
-                    dcc.Graph(id='weather-impact')
-                ])
-            ])
-        ], width=6),
-        dbc.Col([
-            dbc.Card([
-                dbc.CardHeader("Fabbisogno Idrico Mensile"),
-                dbc.CardBody([
-                    dcc.Graph(id='water-needs')
-                ])
-            ])
-        ], width=6)
+                    # Sezione Costi di Trasformazione
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Costi di Trasformazione"),
+                                dbc.CardBody([
+                                    dbc.Row([
+                                        dbc.Col([
+                                            html.H5("Frantoio", className="mb-3"),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Molitura: "),
+                                                    "€0.15/kg olive"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Stoccaggio: "),
+                                                    "€0.20/L olio"
+                                                ])
+                                            ], flush=True)
+                                        ], md=6),
+                                        dbc.Col([
+                                            html.H5("Imbottigliamento", className="mb-3"),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Bottiglia (1L): "),
+                                                    "€1.20/unità"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Etichettatura: "),
+                                                    "€0.30/bottiglia"
+                                                ])
+                                            ], flush=True)
+                                        ], md=6)
+                                    ])
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=12)
+                    ]),
+
+                    # Sezione Ricavi e Guadagni
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Analisi Economica"),
+                                dbc.CardBody([
+                                    dbc.Row([
+                                        dbc.Col([
+                                            html.H5("Ricavi", className="mb-3"),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Prezzo vendita olio: "),
+                                                    "€12.00/L"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Ricavo totale: "),
+                                                    "€48,000.00"
+                                                ])
+                                            ], flush=True)
+                                        ], md=4),
+                                        dbc.Col([
+                                            html.H5("Costi Totali", className="mb-3"),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Costi produzione: "),
+                                                    "€25,000.00"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Costi trasformazione: "),
+                                                    "€8,000.00"
+                                                ])
+                                            ], flush=True)
+                                        ], md=4),
+                                        dbc.Col([
+                                            html.H5("Margini", className="mb-3"),
+                                            dbc.ListGroup([
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Margine lordo: "),
+                                                    "€15,000.00"
+                                                ]),
+                                                dbc.ListGroupItem([
+                                                    html.Strong("Margine per litro: "),
+                                                    "€3.75/L"
+                                                ])
+                                            ], flush=True)
+                                        ], md=4)
+                                    ])
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=12)
+                    ]),
+
+                    # Grafici Finanziari
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Distribuzione Costi"),
+                                dbc.CardBody([
+                                    dcc.Graph(
+                                        figure=px.pie(
+                                            values=[2000, 500, 800, 1500, 600, 400],
+                                            names=['Ammortamento', 'Assicurazione', 'Manutenzione',
+                                                   'Raccolta', 'Potatura', 'Fertilizzanti'],
+                                            title='Distribuzione Costi per Ettaro'
+                                        ),
+                                        config={'displayModeBar': False}
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=6),
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader("Analisi Break-Even"),
+                                dbc.CardBody([
+                                    dcc.Graph(
+                                        figure=px.line(
+                                            x=[0, 1000, 2000, 3000, 4000],
+                                            y=[[0, 12000, 24000, 36000, 48000],
+                                               [5000, 15000, 25000, 35000, 45000]],
+                                            title='Analisi Break-Even',
+                                            labels={'x': 'Litri di olio', 'y': 'Euro'}
+                                        ),
+                                        config={'displayModeBar': False}
+                                    )
+                                ])
+                            ], style=CARD_STYLE)
+                        ], md=6)
+                    ])
+                ], label="Analisi Economica", tab_id="tab-financial"),
+
+                # Tab Configurazione
+                dbc.Tab([
+                    dbc.Row([
+                        # Configurazione Oliveto
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader([
+                                    html.H4("Configurazione Oliveto", className="text-primary mb-0"),
+                                ], className="bg-light"),
+                                dbc.CardBody([
+                                    # Hectares input
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Ettari totali:", className="fw-bold"),
+                                            dbc.Input(
+                                                id='hectares-input',
+                                                type='number',
+                                                value=1,
+                                                min=1,
+                                                className="mb-3"
+                                            )
+                                        ])
+                                    ]),
+
+                                    # Variety sections
+                                    html.Div([
+                                        # Variety 1
+                                        html.Div([
+                                            html.H6("Varietà 1", className="text-primary mb-3"),
+                                            dbc.Row([
+                                                dbc.Col([
+                                                    dbc.Label("Varietà:", className="fw-bold"),
+                                                    dcc.Dropdown(
+                                                        id='variety-1-dropdown',
+                                                        options=[{'label': v, 'value': v}
+                                                                 for v in olive_varieties['Varietà di Olive'].unique()],
+                                                        value=olive_varieties['Varietà di Olive'].iloc[0],
+                                                        className="mb-2"
+                                                    ),
+                                                ], md=4),
+                                                dbc.Col([
+                                                    dbc.Label("Tecnica:", className="fw-bold"),
+                                                    dcc.Dropdown(
+                                                        id='technique-1-dropdown',
+                                                        options=[
+                                                            {'label': 'Tradizionale', 'value': 'Tradizionale'},
+                                                            {'label': 'Intensiva', 'value': 'Intensiva'},
+                                                            {'label': 'Superintensiva', 'value': 'Superintensiva'}
+                                                        ],
+                                                        value='Tradizionale',
+                                                        className="mb-2"
+                                                    ),
+                                                ], md=4),
+                                                dbc.Col([
+                                                    dbc.Label("Percentuale:", className="fw-bold"),
+                                                    dbc.Input(
+                                                        id='percentage-1-input',
+                                                        type='number',
+                                                        min=1,
+                                                        max=100,
+                                                        value=100,
+                                                        className="mb-2"
+                                                    )
+                                                ], md=4)
+                                            ])
+                                        ], className="mb-4"),
+
+                                        # Variety 2
+                                        html.Div([
+                                            html.H6("Varietà 2 (opzionale)", className="text-primary mb-3"),
+                                            dbc.Row([
+                                                dbc.Col([
+                                                    dbc.Label("Varietà:", className="fw-bold"),
+                                                    dcc.Dropdown(
+                                                        id='variety-2-dropdown',
+                                                        options=[{'label': v, 'value': v}
+                                                                 for v in olive_varieties['Varietà di Olive'].unique()],
+                                                        value=None,
+                                                        className="mb-2"
+                                                    ),
+                                                ], md=4),
+                                                dbc.Col([
+                                                    dbc.Label("Tecnica:", className="fw-bold"),
+                                                    dcc.Dropdown(
+                                                        id='technique-2-dropdown',
+                                                        options=[
+                                                            {'label': 'Tradizionale', 'value': 'Tradizionale'},
+                                                            {'label': 'Intensiva', 'value': 'Intensiva'},
+                                                            {'label': 'Superintensiva', 'value': 'Superintensiva'}
+                                                        ],
+                                                        value=None,
+                                                        disabled=True,
+                                                        className="mb-2"
+                                                    ),
+                                                ], md=4),
+                                                dbc.Col([
+                                                    dbc.Label("Percentuale:", className="fw-bold"),
+                                                    dbc.Input(
+                                                        id='percentage-2-input',
+                                                        type='number',
+                                                        min=0,
+                                                        max=99,
+                                                        value=0,
+                                                        disabled=True,
+                                                        className="mb-2"
+                                                    )
+                                                ], md=4)
+                                            ])
+                                        ], className="mb-4"),
+
+                                        # Variety 3
+                                        html.Div([
+                                            html.H6("Varietà 3 (opzionale)", className="text-primary mb-3"),
+                                            dbc.Row([
+                                                dbc.Col([
+                                                    dbc.Label("Varietà:", className="fw-bold"),
+                                                    dcc.Dropdown(
+                                                        id='variety-3-dropdown',
+                                                        options=[{'label': v, 'value': v}
+                                                                 for v in olive_varieties['Varietà di Olive'].unique()],
+                                                        value=None,
+                                                        className="mb-2"
+                                                    ),
+                                                ], md=4),
+                                                dbc.Col([
+                                                    dbc.Label("Tecnica:", className="fw-bold"),
+                                                    dcc.Dropdown(
+                                                        id='technique-3-dropdown',
+                                                        options=[
+                                                            {'label': 'Tradizionale', 'value': 'Tradizionale'},
+                                                            {'label': 'Intensiva', 'value': 'Intensiva'},
+                                                            {'label': 'Superintensiva', 'value': 'Superintensiva'}
+                                                        ],
+                                                        value=None,
+                                                        disabled=True,
+                                                        className="mb-2"
+                                                    ),
+                                                ], md=4),
+                                                dbc.Col([
+                                                    dbc.Label("Percentuale:", className="fw-bold"),
+                                                    dbc.Input(
+                                                        id='percentage-3-input',
+                                                        type='number',
+                                                        min=0,
+                                                        max=99,
+                                                        value=0,
+                                                        disabled=True,
+                                                        className="mb-2"
+                                                    )
+                                                ], md=4)
+                                            ])
+                                        ], className="mb-4"),
+                                    ]),
+
+                                    # Warning message
+                                    html.Div(
+                                        id='percentage-warning',
+                                        className="text-danger mt-3"
+                                    )
+                                ])
+                            ], className="mb-4")
+                        ], md=6),
+
+                        # Configurazione Costi
+                        dbc.Col([
+                            dbc.Card([
+                                dbc.CardHeader([
+                                    html.H4("Configurazione Costi", className="text-primary mb-0")
+                                ], className="bg-light"),
+                                dbc.CardBody([
+                                    # Costi Fissi
+                                    html.H5("Costi Fissi Annuali", className="mb-3"),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Ammortamento impianto (€/ha):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-ammortamento',
+                                                type='number',
+                                                value=2000,
+                                                min=0,
+                                                className="mb-2"
+                                            )
+                                        ], md=6),
+                                        dbc.Col([
+                                            dbc.Label("Assicurazione (€/ha):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-assicurazione',
+                                                type='number',
+                                                value=500,
+                                                min=0,
+                                                className="mb-2"
+                                            )
+                                        ], md=6)
+                                    ]),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Manutenzione (€/ha):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-manutenzione',
+                                                type='number',
+                                                value=800,
+                                                min=0,
+                                                className="mb-2"
+                                            )
+                                        ], md=6)
+                                    ], className="mb-4"),
+
+                                    # Costi Variabili
+                                    html.H5("Costi Variabili", className="mb-3"),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Manodopera raccolta (€/kg):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-raccolta',
+                                                type='number',
+                                                value=0.35,
+                                                min=0,
+                                                step=0.01,
+                                                className="mb-2"
+                                            )
+                                        ], md=6),
+                                        dbc.Col([
+                                            dbc.Label("Potatura (€/ha):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-potatura',
+                                                type='number',
+                                                value=600,
+                                                min=0,
+                                                className="mb-2"
+                                            )
+                                        ], md=6)
+                                    ]),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Fertilizzanti (€/ha):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-fertilizzanti',
+                                                type='number',
+                                                value=400,
+                                                min=0,
+                                                className="mb-2"
+                                            )
+                                        ], md=6)
+                                    ], className="mb-4"),
+
+                                    # Costi Trasformazione
+                                    html.H5("Costi Trasformazione", className="mb-3"),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Molitura (€/kg olive):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-molitura',
+                                                type='number',
+                                                value=0.15,
+                                                min=0,
+                                                step=0.01,
+                                                className="mb-2"
+                                            )
+                                        ], md=6),
+                                        dbc.Col([
+                                            dbc.Label("Stoccaggio (€/L olio):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-stoccaggio',
+                                                type='number',
+                                                value=0.20,
+                                                min=0,
+                                                step=0.01,
+                                                className="mb-2"
+                                            )
+                                        ], md=6)
+                                    ]),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Bottiglia 1L (€/unità):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-bottiglia',
+                                                type='number',
+                                                value=1.20,
+                                                min=0,
+                                                step=0.01,
+                                                className="mb-2"
+                                            )
+                                        ], md=6),
+                                        dbc.Col([
+                                            dbc.Label("Etichettatura (€/bottiglia):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='cost-etichettatura',
+                                                type='number',
+                                                value=0.30,
+                                                min=0,
+                                                step=0.01,
+                                                className="mb-2"
+                                            )
+                                        ], md=6)
+                                    ], className="mb-4"),
+
+                                    # Prezzo Vendita
+                                    html.H5("Prezzo di Vendita", className="mb-3"),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Prezzo vendita olio (€/L):", className="fw-bold"),
+                                            dbc.Input(
+                                                id='price-olio',
+                                                type='number',
+                                                value=12.00,
+                                                min=0,
+                                                step=0.01,
+                                                className="mb-2"
+                                            )
+                                        ], md=6)
+                                    ])
+                                ])
+                            ])
+                        ], md=6),
+                        html.Div([
+                            dbc.Button(
+                                "Salva Configurazione",
+                                id="save-config-button",
+                                color="primary",
+                                className="mt-3"
+                            ),
+                            html.Div(
+                                id="save-config-message",
+                                className="mt-2"
+                            )
+                        ], className="text-center")
+                    ])
+                ], label="Configurazione", tab_id="tab-config"),
+            ], id="tabs", active_tab="tab-production")
+        ], md=12, lg=12)
     ])
-], fluid=True)
+], fluid=True, className="px-4 py-3")
 
-# Callback per la gestione delle percentuali e abilitazione dei campi
+
 @app.callback(
-    [Output('technique-2-dropdown', 'disabled'),
-     Output('percentage-2-input', 'disabled'),
-     Output('technique-3-dropdown', 'disabled'),
-     Output('percentage-3-input', 'disabled'),
-     Output('percentage-warning', 'children')],
-    [Input('variety-2-dropdown', 'value'),
-     Input('variety-3-dropdown', 'value'),
-     Input('percentage-1-input', 'value'),
-     Input('percentage-2-input', 'value'),
-     Input('percentage-3-input', 'value')]
+    Output("save-config-message", "children"),
+    [Input("save-config-button", "n_clicks")],
+    [State("hectares-input", "value"),
+     State("variety-1-dropdown", "value"),
+     State("technique-1-dropdown", "value"),
+     State("percentage-1-input", "value"),
+     State("variety-2-dropdown", "value"),
+     State("technique-2-dropdown", "value"),
+     State("percentage-2-input", "value"),
+     State("variety-3-dropdown", "value"),
+     State("technique-3-dropdown", "value"),
+     State("percentage-3-input", "value"),
+     State("cost-ammortamento", "value"),
+     State("cost-assicurazione", "value"),
+     State("cost-manutenzione", "value"),
+     State("cost-raccolta", "value"),
+     State("cost-potatura", "value"),
+     State("cost-fertilizzanti", "value"),
+     State("cost-molitura", "value"),
+     State("cost-stoccaggio", "value"),
+     State("cost-bottiglia", "value"),
+     State("cost-etichettatura", "value"),
+     State("price-olio", "value")]
 )
-def manage_percentages(variety2, variety3, perc1, perc2, perc3):
+def save_configuration(n_clicks, hectares, var1, tech1, perc1, var2, tech2, perc2,
+                       var3, tech3, perc3, amm, ass, man, rac, pot, fer, mol, sto,
+                       bot, eti, price):
+    if n_clicks is None:
+        return no_update
+
+    # Prepara la configurazione
+    varieties = [{"variety": var1, "technique": tech1, "percentage": perc1}]
+    if var2:
+        varieties.append({"variety": var2, "technique": tech2, "percentage": perc2})
+    if var3:
+        varieties.append({"variety": var3, "technique": tech3, "percentage": perc3})
+
+    config = {
+        'oliveto': {
+            'hectares': hectares,
+            'varieties': varieties
+        },
+        'costs': {
+            'fixed': {
+                'ammortamento': amm,
+                'assicurazione': ass,
+                'manutenzione': man
+            },
+            'variable': {
+                'raccolta': rac,
+                'potatura': pot,
+                'fertilizzanti': fer
+            },
+            'transformation': {
+                'molitura': mol,
+                'stoccaggio': sto,
+                'bottiglia': bot,
+                'etichettatura': eti
+            },
+            'selling_price': price
+        }
+    }
+
+    if save_config(config):
+        return dbc.Alert(
+            "Configurazione salvata con successo!",
+            color="success",
+            duration=4000,
+            is_open=True
+        )
+    else:
+        return dbc.Alert(
+            "Errore nel salvataggio della configurazione",
+            color="danger",
+            duration=4000,
+            is_open=True
+        )
+
+@app.callback(
+    [
+        Output("hectares-input", "value"),
+        Output("variety-1-dropdown", "value"),
+        Output("technique-1-dropdown", "value"),
+        Output("percentage-1-input", "value"),
+        Output("variety-2-dropdown", "value"),
+        Output("cost-ammortamento", "value"),
+        Output("cost-assicurazione", "value"),
+        Output("cost-manutenzione", "value"),
+        Output("cost-raccolta", "value"),
+        Output("cost-potatura", "value"),
+        Output("cost-fertilizzanti", "value"),
+        Output("cost-molitura", "value"),
+        Output("cost-stoccaggio", "value"),
+        Output("cost-bottiglia", "value"),
+        Output("cost-etichettatura", "value"),
+        Output("price-olio", "value")
+    ],
+    [Input("tabs", "active_tab")]
+)
+def load_saved_config(tab):
+    if tab != "tab-config":
+        return [no_update] * 16
+
+    config = load_config()
+
+    varieties = config['oliveto']['varieties']
+    var1 = varieties[0] if len(varieties) > 0 else {"variety": None, "technique": None, "percentage": 0}
+    var2 = varieties[1] if len(varieties) > 1 else {"variety": None, "technique": None, "percentage": 0}
+
+    costs = config['costs']
+
+    return [
+        config['oliveto']['hectares'],
+        var1["variety"],
+        var1["technique"],
+        var1["percentage"],
+        var2["variety"],
+        costs['fixed']['ammortamento'],
+        costs['fixed']['assicurazione'],
+        costs['fixed']['manutenzione'],
+        costs['variable']['raccolta'],
+        costs['variable']['potatura'],
+        costs['variable']['fertilizzanti'],
+        costs['transformation']['molitura'],
+        costs['transformation']['stoccaggio'],
+        costs['transformation']['bottiglia'],
+        costs['transformation']['etichettatura'],
+        costs['selling_price']
+    ]
+
+
+# Aggiorna la configurazione dei grafici per essere più responsive
+def create_figure_layout(fig, title):
+    fig.update_layout(
+        title=title,
+        title_x=0.5,
+        margin=dict(l=20, r=20, t=40, b=20),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        height=350,
+        font=dict(family="Helvetica, Arial, sans-serif"),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    return fig
+
+
+@app.callback(
+    [
+        Output('technique-2-dropdown', 'disabled'),
+        Output('percentage-2-input', 'disabled'),
+        Output('technique-3-dropdown', 'disabled'),
+        Output('percentage-3-input', 'disabled'),
+        Output('percentage-warning', 'children'),
+        Output('technique-2-dropdown', 'value'),
+        Output('technique-3-dropdown', 'value'),
+        Output('percentage-2-input', 'value'),
+        Output('percentage-3-input', 'value')
+    ],
+    [
+        Input('variety-2-dropdown', 'value'),
+        Input('variety-3-dropdown', 'value'),
+        Input('percentage-1-input', 'value'),
+        Input('percentage-2-input', 'value'),
+        Input('percentage-3-input', 'value')
+    ]
+)
+def manage_percentages_and_techniques(variety2, variety3, perc1, perc2, perc3):
     perc1 = perc1 or 0
     perc2 = perc2 or 0
     perc3 = perc3 or 0
     total = perc1 + perc2 + perc3
 
-    # Abilita/disabilita campi basati sulle selezioni
+    # Gestione varietà 2
     disable_2 = variety2 is None
+    technique2_value = None if disable_2 else 'Tradizionale'
+    percentage2_value = 0 if disable_2 else (perc2 if perc2 else 0)
+
+    # Gestione varietà 3
     disable_3 = variety3 is None or variety2 is None
+    technique3_value = None if disable_3 else 'Tradizionale'
+    percentage3_value = 0 if disable_3 else (perc3 if perc3 else 0)
 
+    # Gestione warning percentuali - ora mostra sempre il warning se non è 100%
     warning = ""
-    if total > 100:
-        warning = "La somma delle percentuali non può superare 100%"
-    elif total < 100:
-        warning = f"La somma delle percentuali è {total}% (dovrebbe essere 100%)"
+    if total != 100:
+        if total > 100:
+            warning = f"La somma delle percentuali è {total}% (dovrebbe essere 100%)"
+        else:
+            warning = f"La somma delle percentuali è {total}% (dovrebbe essere 100%)"
 
-    return disable_2, disable_2, disable_3, disable_3, warning
+    return (
+        disable_2,
+        disable_2,
+        disable_3,
+        disable_3,
+        warning,
+        technique2_value,
+        technique3_value,
+        percentage2_value,
+        percentage3_value
+    )
 
-# Aggiorna il callback principale per utilizzare multiple varietà
+
+# Aggiunta callback per resettare i valori della varietà 3 quando la varietà 2 viene deselezionata
 @app.callback(
-    [Output('olive-production', 'children'),
+    [
+        Output('variety-3-dropdown', 'value'),
+        Output('variety-3-dropdown', 'disabled')
+    ],
+    [
+        Input('variety-2-dropdown', 'value')
+    ]
+)
+def manage_variety3_availability(variety2):
+    if variety2 is None:
+        return None, True
+    return no_update, False
+
+
+# Modifica il callback update_dashboard per utilizzare il nuovo layout dei grafici
+@app.callback(
+    [Output('olive-production_ha', 'children'),
+     Output('oil-production_ha', 'children'),
+     Output('water-need_ha', 'children'),
+     Output('olive-production', 'children'),
      Output('oil-production', 'children'),
      Output('water-need', 'children'),
      Output('production-details', 'figure'),
@@ -789,8 +1376,7 @@ def manage_percentages(variety2, variety3, perc1, perc2, perc3):
 )
 def update_dashboard(variety1, tech1, perc1, variety2, tech2, perc2,
                      variety3, tech3, perc3, hectares):
-    # Verifica i dati di input
-    if not variety1 or not tech1 or perc1 is None or hectares is None:
+    if not variety1 or not tech1 or perc1 is None or hectares is None or hectares <= 0:
         return "N/A", "N/A", "N/A", {}, {}, {}, ""
 
     # Raccogli le informazioni delle varietà
@@ -827,241 +1413,275 @@ def update_dashboard(variety1, tech1, perc1, variety2, tech2, perc2,
             percentages.append(perc3)
 
     try:
-        # Prepara i dati e fai la predizione
         prediction = make_prediction(weather_data, varieties_info, percentages, hectares)
 
-        # Formatta output
-        olive_prod_text = f"{prediction['olive_production']:.0f} kg/ha"
-        oil_prod_text = f"{prediction['avg_oil_production']:.0f} L/ha"
-        water_need_text = f"{prediction['water_need']:.0f} m³/ha"
+        # Formattazione output principale
+        # Formattazione output con valori per ettaro e totali
+        olive_prod_text_ha = f"{prediction['olive_production']:.0f} kg/ha\n"
+        olive_prod_text = f"Totale: {prediction['olive_production_total']:.0f} kg"
 
-        # Crea il grafico dei dettagli di produzione
-        details_data = []
+        oil_prod_text_ha = f"{prediction['avg_oil_production']:.0f} L/ha\n"
+        oil_prod_text = f"Totale: {(prediction['avg_oil_production_total'] * hectares):.0f} L"
 
-        # Aggiungi dati per ogni varietà
-        for detail in prediction['variety_details']:
-            details_data.extend([
-                {
-                    'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
-                    'Tipo': 'Olive',
-                    'Produzione': detail['production_per_ha'] * (detail['percentage']/100)
-                },
-                {
-                    'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
-                    'Tipo': 'Olio',
-                    'Produzione': detail['oil_per_ha'] * (detail['percentage']/100)
-                }
-            ])
+        water_need_text_ha = f"{prediction['water_need']:.0f} m³/ha\n"
+        water_need_text = f"Totale: {prediction['water_need_total']:.0f} m³"
 
-        # Aggiungi totali
-        details_data.extend([
-            {
-                'Varietà': 'Totale',
-                'Tipo': 'Olive',
-                'Produzione': prediction['olive_production']
-            },
-            {
-                'Varietà': 'Totale',
-                'Tipo': 'Olio',
-                'Produzione': prediction['avg_oil_production']
-            }
-        ])
+        # Creazione grafici con il nuovo stile
+        details_fig = create_production_details_figure(prediction)
+        weather_fig = create_weather_impact_figure(weather_data)
+        water_fig = create_water_needs_figure(prediction)
 
-        # Crea il grafico dei dettagli
-        details_df = pd.DataFrame(details_data)
-        details_fig = px.bar(
-            details_df,
-            x='Varietà',
-            y='Produzione',
-            color='Tipo',
-            barmode='group',
-            title='Dettagli Produzione per Varietà',
-            labels={'Produzione': 'kg/ha o L/ha'},
-            color_discrete_map={'Olive': '#1f77b4', 'Olio': '#2ca02c'}
-        )
-        details_fig.update_layout(
-            legend_title_text='Prodotto',
-            xaxis_tickangle=-45
-        )
+        # Creazione info extra con il nuovo stile
+        extra_info = create_extra_info_component(prediction, varieties_info)
 
-        # Grafico impatto meteo
-        recent_weather = weather_data.tail(41).copy()
-        weather_impact = px.scatter(
-            recent_weather,
-            x='temp',
-            y='solarradiation',
-            size='precip',
-            title='Condizioni Meteorologiche',
-            labels={
-                'temp': 'Temperatura (°C)',
-                'solarradiation': 'Radiazione Solare (W/m²)',
-                'precip': 'Precipitazioni (mm)'
-            }
-        )
-        weather_impact.update_layout(
-            legend_title_text='Precipitazioni',
-            showlegend=True
-        )
+        return (
+            olive_prod_text_ha, oil_prod_text_ha, water_need_text_ha,
+            olive_prod_text, oil_prod_text, water_need_text,
+            details_fig, weather_fig, water_fig, extra_info)
 
-        # Grafico fabbisogno idrico
-        water_data = []
-        months = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
-                  'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
+    except Exception as e:
+        print(f"Errore nell'aggiornamento dashboard: {str(e)}")
+        return "Errore", "Errore", "Errore", {}, {}, {}, "Errore nella generazione dei dati"
 
-        # Calcola il fabbisogno idrico mensile per ogni varietà
-        for detail in prediction['variety_details']:
+
+def create_production_details_figure(prediction):
+    """Crea il grafico dei dettagli produzione con il nuovo stile"""
+    details_data = prepare_details_data(prediction)
+    fig = px.bar(
+        details_data,
+        x='Varietà',
+        y='Produzione',
+        color='Tipo',
+        barmode='group',
+        color_discrete_map={'Olive': '#2185d0', 'Olio': '#21ba45'}
+    )
+    return create_figure_layout(fig, 'Dettagli Produzione per Varietà')
+
+
+def create_weather_impact_figure(weather_data):
+    """Crea il grafico dell'impatto meteorologico con il nuovo stile"""
+    recent_weather = weather_data.tail(41).copy()
+    fig = px.scatter(
+        recent_weather,
+        x='temp',
+        y='solarradiation',
+        size='precip',
+        color_discrete_sequence=['#2185d0']
+    )
+    return create_figure_layout(fig, 'Condizioni Meteorologiche')
+
+
+def create_water_needs_figure(prediction):
+    """Crea il grafico del fabbisogno idrico con il nuovo stile"""
+    months = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
+              'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
+
+    water_data = []
+    for detail in prediction['variety_details']:
+        for month in months:
+            season = get_season_from_month(month)
             variety_info = olive_varieties[
                 olive_varieties['Varietà di Olive'] == detail['variety']
                 ].iloc[0]
 
-            seasonal_water = {
-                'Inverno': variety_info['Fabbisogno Acqua Inverno (m³/ettaro)'],
-                'Primavera': variety_info['Fabbisogno Acqua Primavera (m³/ettaro)'],
-                'Estate': variety_info['Fabbisogno Acqua Estate (m³/ettaro)'],
-                'Autunno': variety_info['Fabbisogno Acqua Autunno (m³/ettaro)']
-            }
+            water_need = variety_info[f'Fabbisogno Acqua {season} (m³/ettaro)']
+            water_data.append({
+                'Mese': month,
+                'Varietà': detail['variety'],
+                'Fabbisogno': water_need * (detail['percentage'] / 100)
+            })
 
-            for month in months:
-                season = get_season_from_month(month)
-                water_data.append({
-                    'Mese': month,
-                    'Varietà': detail['variety'],
-                    'Fabbisogno': seasonal_water[season] * (detail['percentage']/100)
-                })
+    water_df = pd.DataFrame(water_data)
+    fig = px.bar(
+        water_df,
+        x='Mese',
+        y='Fabbisogno',
+        color='Varietà',
+        barmode='stack',
+        color_discrete_sequence=['#2185d0', '#21ba45', '#6435c9']
+    )
+    return create_figure_layout(fig, 'Fabbisogno Idrico Mensile')
 
-        # Crea il grafico del fabbisogno idrico
-        water_df = pd.DataFrame(water_data)
-        water_needs = px.bar(
-            water_df,
-            x='Mese',
-            y='Fabbisogno',
-            color='Varietà',
-            title='Fabbisogno Idrico Mensile per Varietà',
-            labels={'Fabbisogno': 'm³/ettaro'},
-            barmode='stack'
-        )
-        water_needs.update_layout(
-            legend_title_text='Varietà',
-            xaxis_tickangle=0
-        )
 
-        extra_info = html.Div([
-            html.H5("Dettagli per Varietà", className="mb-3"),
-            html.Div([
-                # Crea una card per ogni varietà
+def create_extra_info_component(prediction, varieties_info):
+    """Crea il componente delle informazioni dettagliate con il nuovo stile"""
+    cards = []
+
+    # Card per ogni varietà
+    for detail, variety_info in zip(prediction['variety_details'], varieties_info):
+        variety_card = dbc.Card([
+            dbc.CardHeader(
+                html.H5(f"{detail['variety']} - {detail['percentage']}%",
+                        className="mb-0 text-primary")
+            ),
+            dbc.CardBody([
                 dbc.Row([
                     dbc.Col([
-                        dbc.Card([
-                            dbc.CardHeader(
-                                f"{detail['variety']} - {detail['percentage']}%",
-                                className="font-weight-bold"
-                            ),
-                            dbc.CardBody([
-                                # Trova i dettagli completi della varietà dal dataset originale
-                                html.Div([
-                                    # Produzione
-                                    html.Div([
-                                        html.H6("Produzione Prevista:", className="mb-2"),
-                                        html.P([
-                                            html.Span("Olive: ", className="font-weight-bold"),
-                                            f"{detail['production_per_ha'] * (detail['percentage']/100):.0f} kg/ha"
-                                        ]),
-                                        html.P([
-                                            html.Span("Olio: ", className="font-weight-bold"),
-                                            f"{detail['oil_per_ha'] * (detail['percentage']/100):.0f} L/ha"
-                                        ]),
-                                    ], className="mb-3"),
+                        html.Div([
+                            html.H6("Produzione", className="text-muted mb-3"),
+                            dbc.ListGroup([
+                                dbc.ListGroupItem([
+                                    html.Strong("Olive: "),
+                                    f"{detail['production_total']:.0f} kg"
+                                ], className="px-2 py-1"),
+                                dbc.ListGroupItem([
+                                    html.Strong("Olio: "),
+                                    f"{detail['oil_total']:.0f} L"
+                                ], className="px-2 py-1"),
+                                dbc.ListGroupItem([
+                                    html.Strong("Resa: "),
+                                    f"{detail['oil_total'] / detail['production_total']:.3f} %"
+                                ], className="px-2 py-1")
+                            ], flush=True)
+                        ])
+                    ], md=4),
+                    # Colonna Produzione/ha
+                    dbc.Col([
+                        html.Div([
+                            html.H6("Produzione/ha", className="text-muted mb-3"),
+                            dbc.ListGroup([
+                                dbc.ListGroupItem([
+                                    html.Strong("Olive: "),
+                                    f"{detail['production_per_ha']:.0f} kg/ha"
+                                ], className="px-2 py-1"),
+                                dbc.ListGroupItem([
+                                    html.Strong("Olio: "),
+                                    f"{detail['oil_per_ha']:.0f} L/ha"
+                                ], className="px-2 py-1")
+                            ], flush=True)
+                        ])
+                    ], md=4),
+                    # Colonna Rese
+                    dbc.Col([
+                        html.Div([
+                            html.H6("Caratteristiche", className="text-muted mb-3"),
+                            dbc.ListGroup([
+                                dbc.ListGroupItem([
+                                    html.Strong("Resa: "),
+                                    f"{variety_info['Min % Resa']:.1f}% - {variety_info['Max % Resa']:.1f}%"
+                                ], className="px-2 py-1"),
+                                dbc.ListGroupItem([
+                                    html.Strong("L/t: "),
+                                    f"{variety_info['Min Litri per Tonnellata']:.0f} - {variety_info['Max Litri per Tonnellata']:.0f}"
+                                ], className="px-2 py-1")
+                            ], flush=True)
+                        ])
+                    ], md=4)
+                ]),
 
-                                    # Rese
-                                    html.Div([
-                                        html.H6("Rese:", className="mb-2"),
-                                        html.P([
-                                            html.Span("Resa in Olio: ", className="font-weight-bold"),
-                                            f"{variety_info['Min % Resa']:.1f}% - {variety_info['Max % Resa']:.1f}%"
-                                        ]),
-                                        html.P([
-                                            html.Span("Litri per Tonnellata: ", className="font-weight-bold"),
-                                            f"{variety_info['Min Litri per Tonnellata']:.0f} - {variety_info['Max Litri per Tonnellata']:.0f} L/t"
-                                        ])
-                                    ], className="mb-3"),
-
-                                    # Caratteristiche
-                                    html.Div([
-                                        html.H6("Caratteristiche:", className="mb-2"),
-                                        html.P([
-                                            html.Span("Temperatura Ottimale: ", className="font-weight-bold"),
-                                            f"{variety_info['Temperatura Ottimale']}°C"
-                                        ]),
-                                        html.P([
-                                            html.Span("Resistenza alla Siccità: ", className="font-weight-bold"),
-                                            f"{variety_info['Resistenza']}"
-                                        ])
-                                    ], className="mb-3"),
-
-                                    # Fabbisogno Idrico
-                                    html.Div([
-                                        html.H6("Fabbisogno Idrico Stagionale:", className="mb-2"),
-                                        html.P([
-                                            html.Span("Primavera: ", className="font-weight-bold"),
-                                            f"{variety_info['Fabbisogno Acqua Primavera (m³/ettaro)']:.0f} m³/ha"
-                                        ]),
-                                        html.P([
-                                            html.Span("Estate: ", className="font-weight-bold"),
-                                            f"{variety_info['Fabbisogno Acqua Estate (m³/ettaro)']:.0f} m³/ha"
-                                        ]),
-                                        html.P([
-                                            html.Span("Autunno: ", className="font-weight-bold"),
-                                            f"{variety_info['Fabbisogno Acqua Autunno (m³/ettaro)']:.0f} m³/ha"
-                                        ]),
-                                        html.P([
-                                            html.Span("Inverno: ", className="font-weight-bold"),
-                                            f"{variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']:.0f} m³/ha"
-                                        ])
-                                    ])
+                # Fabbisogno Idrico
+                dbc.Row([
+                    dbc.Col([
+                        html.H6("Fabbisogno Idrico Stagionale",
+                                className="text-muted mb-3 mt-3"),
+                        dbc.Table([
+                            html.Thead([
+                                html.Tr([
+                                    html.Th("Stagione"),
+                                    html.Th("m³/ha")
+                                ])
+                            ]),
+                            html.Tbody([
+                                html.Tr([
+                                    html.Td("Primavera"),
+                                    html.Td(f"{variety_info['Fabbisogno Acqua Primavera (m³/ettaro)']:.0f}")
+                                ]),
+                                html.Tr([
+                                    html.Td("Estate"),
+                                    html.Td(f"{variety_info['Fabbisogno Acqua Estate (m³/ettaro)']:.0f}")
+                                ]),
+                                html.Tr([
+                                    html.Td("Autunno"),
+                                    html.Td(f"{variety_info['Fabbisogno Acqua Autunno (m³/ettaro)']:.0f}")
+                                ]),
+                                html.Tr([
+                                    html.Td("Inverno"),
+                                    html.Td(f"{variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']:.0f}")
                                 ])
                             ])
-                        ], className="h-100")
-                    ], width=12 if len(prediction['variety_details']) == 1 else
-                    6 if len(prediction['variety_details']) == 2 else 4,
-                        className="mb-3")
-                    for detail in prediction['variety_details']
-                    for variety_info in [olive_varieties[
-                                             olive_varieties['Varietà di Olive'] == detail['variety']
-                                             ].iloc[0]]
-                ], className="mb-4"),
-
-                # Sezione totali
-                dbc.Card([
-                    dbc.CardHeader("Totali Previsti", className="font-weight-bold"),
-                    dbc.CardBody([
-                        html.Div([
-                            html.P([
-                                html.Span("Produzione Totale Olive: ", className="font-weight-bold"),
-                                f"{prediction['olive_production']:.0f} kg/ha"
-                            ]),
-                            html.P([
-                                html.Span("Produzione Totale Olio: ", className="font-weight-bold"),
-                                f"{prediction['avg_oil_production']:.0f} L/ha"
-                            ]),
-                            html.P([
-                                html.Span("Resa Media in Olio: ", className="font-weight-bold"),
-                                f"{(prediction['avg_oil_production']/prediction['olive_production']*100):.1f}%"
-                            ]),
-                            html.P([
-                                html.Span("Fabbisogno Idrico Totale: ", className="font-weight-bold"),
-                                f"{prediction['water_need']:.0f} m³/ha"
-                            ])
-                        ])
+                        ], size="sm", bordered=True)
                     ])
                 ])
             ])
-        ], className="mt-4")
+        ], className="mb-3", style=CARD_STYLE)
+        cards.append(variety_card)
 
-        return olive_prod_text, oil_prod_text, water_need_text, details_fig, weather_impact, water_needs, extra_info
+    # Card riepilogo totali
+    summary_card = dbc.Card([
+        dbc.CardHeader(
+            html.H5("Riepilogo Totali", className="mb-0 text-primary")
+        ),
+        dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    dbc.ListGroup([
+                        dbc.ListGroupItem([
+                            html.Strong("Produzione Olive: "),
+                            f"{prediction['olive_production']:.0f} kg/ha"
+                        ], className="px-2 py-1"),
+                        dbc.ListGroupItem([
+                            html.Strong("Produzione Olio: "),
+                            f"{prediction['avg_oil_production']:.0f} L/ha"
+                        ], className="px-2 py-1"),
+                        dbc.ListGroupItem([
+                            html.Strong("Resa Media: "),
+                            f"{(prediction['avg_oil_production_total'] / prediction['olive_production_total']):.3f}%"
+                        ], className="px-2 py-1"),
+                        dbc.ListGroupItem([
+                            html.Strong("Fabbisogno Idrico: "),
+                            f"{prediction['water_need']:.0f} m³/ha"
+                        ], className="px-2 py-1")
+                    ], flush=True)
+                ])
+            ])
+        ])
+    ], className="mb-3", style=CARD_STYLE)
 
-    except Exception as e:
-        print(f"Errore durante la predizione: {str(e)}")
-        return "Errore", "Errore", "Errore", {}, {}, {}, f"Errore: {str(e)}"
+    return html.Div([
+        dbc.Row([
+            dbc.Col(card, md=12 if len(cards) == 1 else 6 if len(cards) == 2 else 4)
+            for card in cards
+        ]),
+        dbc.Row([
+            dbc.Col(summary_card)
+        ])
+    ])
+
+
+def prepare_details_data(prediction):
+    """Prepara i dati per il grafico dei dettagli di produzione"""
+    details_data = []
+
+    # Dati per ogni varietà
+    for detail in prediction['variety_details']:
+        details_data.extend([
+            {
+                'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
+                'Tipo': 'Olive',
+                'Produzione': detail['production_per_ha']
+            },
+            {
+                'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
+                'Tipo': 'Olio',
+                'Produzione': detail['oil_per_ha']
+            }
+        ])
+
+    # Aggiungi totali
+    details_data.extend([
+        {
+            'Varietà': 'Totale',
+            'Tipo': 'Olive',
+            'Produzione': prediction['olive_production']
+        },
+        {
+            'Varietà': 'Totale',
+            'Tipo': 'Olio',
+            'Produzione': prediction['avg_oil_production']
+        }
+    ])
+
+    return pd.DataFrame(details_data)
 
 
 def get_season_from_month(month):
@@ -1073,6 +1693,7 @@ def get_season_from_month(month):
         'Ott': 'Autunno', 'Nov': 'Autunno', 'Dic': 'Inverno'
     }
     return seasons[month]
+
 
 if __name__ == '__main__':
     app.run_server(debug=True)
