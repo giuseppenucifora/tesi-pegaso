@@ -617,47 +617,7 @@ app.layout = dbc.Container([
                     # Sezione Costi
                     dbc.Row([
                         dbc.Col([
-                            dbc.Card([
-                                dbc.CardHeader("Costi di Produzione"),
-                                dbc.CardBody([
-                                    dbc.Row([
-                                        dbc.Col([
-                                            html.H5("Costi Fissi Annuali", className="mb-3"),
-                                            dbc.ListGroup([
-                                                dbc.ListGroupItem([
-                                                    html.Strong("Ammortamento impianto: "),
-                                                    "€2,000.00/ha"
-                                                ]),
-                                                dbc.ListGroupItem([
-                                                    html.Strong("Assicurazione: "),
-                                                    "€500.00/ha"
-                                                ]),
-                                                dbc.ListGroupItem([
-                                                    html.Strong("Manutenzione: "),
-                                                    "€800.00/ha"
-                                                ])
-                                            ], flush=True)
-                                        ], md=6),
-                                        dbc.Col([
-                                            html.H5("Costi Variabili", className="mb-3"),
-                                            dbc.ListGroup([
-                                                dbc.ListGroupItem([
-                                                    html.Strong("Manodopera raccolta: "),
-                                                    "€0.35/kg olive"
-                                                ]),
-                                                dbc.ListGroupItem([
-                                                    html.Strong("Potatura: "),
-                                                    "€600.00/ha"
-                                                ]),
-                                                dbc.ListGroupItem([
-                                                    html.Strong("Fertilizzanti: "),
-                                                    "€400.00/ha"
-                                                ])
-                                            ], flush=True)
-                                        ], md=6)
-                                    ])
-                                ])
-                            ], style=CARD_STYLE)
+                            create_costs_config_section()
                         ], md=12)
                     ]),
 
@@ -1122,6 +1082,209 @@ app.layout = dbc.Container([
         ], md=12, lg=12)
     ])
 ], fluid=True, className="px-4 py-3")
+
+def create_costs_config_section():
+    return dbc.Card([
+        dbc.CardHeader([
+            html.H4("Configurazione Costi e Marketing", className="text-primary mb-0")
+        ], className="bg-light"),
+        dbc.CardBody([
+            # Costi Fissi Annuali (totali)
+            html.H5("Costi Fissi Annuali Totali", className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Ammortamento impianto (€):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-ammortamento',
+                        type='number',
+                        value=10000,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Assicurazioni (€):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-assicurazioni',
+                        type='number',
+                        value=2500,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Manutenzione attrezzature (€):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-manutenzione',
+                        type='number',
+                        value=4000,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Certificazioni e licenze (€):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-certificazioni',
+                        type='number',
+                        value=3000,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ], className="mb-4"),
+
+            # Costi Variabili (per ettaro)
+            html.H5("Costi Variabili per Ettaro", className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Manodopera raccolta (€/ha):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-raccolta',
+                        type='number',
+                        value=1200,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Potatura (€/ha):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-potatura',
+                        type='number',
+                        value=600,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Fertilizzanti (€/ha):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-fertilizzanti',
+                        type='number',
+                        value=400,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Irrigazione (€/ha):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-irrigazione',
+                        type='number',
+                        value=300,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ], className="mb-4"),
+
+            # Costi di Trasformazione
+            html.H5("Costi di Trasformazione", className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Molitura (€/kg olive):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-molitura',
+                        type='number',
+                        value=0.15,
+                        min=0,
+                        step=0.01,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Stoccaggio (€/L olio):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-stoccaggio',
+                        type='number',
+                        value=0.20,
+                        min=0,
+                        step=0.01,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Bottiglia 1L (€/unità):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-bottiglia',
+                        type='number',
+                        value=1.20,
+                        min=0,
+                        step=0.01,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Etichettatura (€/bottiglia):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-etichettatura',
+                        type='number',
+                        value=0.30,
+                        min=0,
+                        step=0.01,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ], className="mb-4"),
+
+            # Marketing e Vendita
+            html.H5("Marketing e Vendita", className="mb-3"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Budget Marketing Annuale (€):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-marketing',
+                        type='number',
+                        value=15000,
+                        min=0,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("Costi commerciali (€/L):", className="fw-bold"),
+                    dbc.Input(
+                        id='cost-commerciali',
+                        type='number',
+                        value=0.50,
+                        min=0,
+                        step=0.01,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ]),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Prezzo vendita olio (€/L):", className="fw-bold"),
+                    dbc.Input(
+                        id='price-olio',
+                        type='number',
+                        value=12.00,
+                        min=0,
+                        step=0.01,
+                        className="mb-2"
+                    )
+                ], md=6),
+                dbc.Col([
+                    dbc.Label("% Vendita diretta:", className="fw-bold"),
+                    dbc.Input(
+                        id='perc-vendita-diretta',
+                        type='number',
+                        value=30,
+                        min=0,
+                        max=100,
+                        className="mb-2"
+                    )
+                ], md=6)
+            ], className="mb-4"),
+        ])
+    ])
 
 
 @app.callback(
