@@ -2,7 +2,8 @@ import psutil
 import multiprocessing
 import re
 import pandas as pd
-from typing import List
+from typing import List, Dict
+import numpy as np
 
 
 def get_optimal_workers() -> int:
@@ -213,3 +214,166 @@ def get_full_data(simulated_data: pd.DataFrame,
         full_data[f'{col}_ma5'] = full_data[col].rolling(window=5, min_periods=1).mean()
 
     return full_data
+
+
+
+
+import numpy as np
+from typing import List, Dict
+
+def prepare_static_features_multiple(varieties_info: List[Dict],
+                                     percentages: List[float],
+                                     hectares: float,
+                                     all_varieties: List[str]) -> np.ndarray:
+    """
+    Prepara le feature statiche per multiple varietà.
+
+    Parameters
+    ----------
+    varieties_info : List[Dict]
+        Lista di dizionari contenenti le informazioni sulle varietà selezionate
+    percentages : List[float]
+        Lista delle percentuali corrispondenti a ciascuna varietà selezionata
+    hectares : float
+        Numero di ettari totali
+    all_varieties : List[str]
+        Lista di tutte le possibili varietà nel dataset originale
+
+    Returns
+    -------
+    np.ndarray
+        Array numpy contenente tutte le feature statiche
+    """
+    # Inizializza un dizionario per tutte le varietà possibili
+    variety_data = {variety.lower(): {
+        'pct': 0,
+        'prod_t_ha': 0,
+        'tech': '',
+        'oil_prod_t_ha': 0,
+        'oil_prod_l_ha': 0,
+        'min_yield_pct': 0,
+        'max_yield_pct': 0,
+        'min_oil_prod_l_ha': 0,
+        'max_oil_prod_l_ha': 0,
+        'avg_oil_prod_l_ha': 0,
+        'l_per_t': 0,
+        'min_l_per_t': 0,
+        'max_l_per_t': 0,
+        'avg_l_per_t': 0,
+        'water_need_spring': 0,
+        'water_need_summer': 0,
+        'water_need_autumn': 0,
+        'water_need_winter': 0,
+        'annual_water_need': 0,
+        'optimal_temp': 0,
+        'drought_resistance': 0
+    } for variety in all_varieties}
+
+    # Aggiorna i dati per le varietà selezionate
+    for variety_info, percentage in zip(varieties_info, percentages):
+        variety_name = clean_column_name(variety_info['variet_di_olive']).lower()
+        technique = clean_column_name(variety_info['tecnica_di_coltivazione']).lower()
+
+        if variety_name not in variety_data:
+            print(f"Attenzione: La varietà '{variety_name}' non è presente nella lista delle varietà conosciute.")
+            continue
+
+        variety_data[variety_name].update({
+            'pct': percentage / 100,
+            'prod_t_ha': variety_info['produzione_tonnellateettaro'],
+            'tech': technique,
+            'oil_prod_t_ha': variety_info['produzione_olio_tonnellateettaro'],
+            'oil_prod_l_ha': variety_info['produzione_olio_litriettaro'],
+            'min_yield_pct': variety_info['min__resa'],
+            'max_yield_pct': variety_info['max__resa'],
+            'min_oil_prod_l_ha': variety_info['min_produzione_olio_litriettaro'],
+            'max_oil_prod_l_ha': variety_info['max_produzione_olio_litriettaro'],
+            'avg_oil_prod_l_ha': variety_info['media_produzione_olio_litriettaro'],
+            'l_per_t': variety_info['litri_per_tonnellata'],
+            'min_l_per_t': variety_info['min_litri_per_tonnellata'],
+            'max_l_per_t': variety_info['max_litri_per_tonnellata'],
+            'avg_l_per_t': variety_info['media_litri_per_tonnellata'],
+            'water_need_spring': variety_info['fabbisogno_acqua_primavera_mettaro'],
+            'water_need_summer': variety_info['fabbisogno_acqua_estate_mettaro'],
+            'water_need_autumn': variety_info['fabbisogno_acqua_autunno_mettaro'],
+            'water_need_winter': variety_info['fabbisogno_acqua_inverno_mettaro'],
+            'annual_water_need': variety_info['fabbisogno_idrico_annuale_mettaro'],
+            'optimal_temp': variety_info['temperatura_ottimale'],
+            'drought_resistance': variety_info['resistenza_alla_siccit']
+        })
+
+    # Crea il vettore delle feature
+    static_features = [hectares]
+
+    # Lista delle feature per ogni varietà
+    variety_features = ['pct', 'prod_t_ha', 'oil_prod_t_ha', 'oil_prod_l_ha',
+                        'min_yield_pct', 'max_yield_pct', 'min_oil_prod_l_ha',
+                        'max_oil_prod_l_ha', 'avg_oil_prod_l_ha', 'l_per_t',
+                        'min_l_per_t', 'max_l_per_t', 'avg_l_per_t',
+                        'water_need_spring', 'water_need_summer', 'water_need_autumn',
+                        'water_need_winter', 'annual_water_need', 'optimal_temp',
+                        'drought_resistance']
+
+    # Appiattisci i dati delle varietà
+    for variety in all_varieties:
+        variety_lower = variety.lower()
+        # Feature esistenti
+        for feature in variety_features:
+            static_features.append(variety_data[variety_lower][feature])
+
+        # Feature binarie per le tecniche
+        for technique in ['tradizionale', 'intensiva', 'superintensiva']:
+            static_features.append(1 if variety_data[variety_lower]['tech'] == technique else 0)
+
+    return np.array(static_features).reshape(1, -1)
+
+
+def get_feature_names(all_varieties: List[str]) -> List[str]:
+    """
+    Genera i nomi delle feature nell'ordine corretto.
+
+    Parameters
+    ----------
+    all_varieties : List[str]
+        Lista di tutte le varietà possibili
+
+    Returns
+    -------
+    List[str]
+        Lista dei nomi delle feature
+    """
+    feature_names = ['hectares']
+
+    variety_features = ['pct', 'prod_t_ha', 'oil_prod_t_ha', 'oil_prod_l_ha',
+                        'min_yield_pct', 'max_yield_pct', 'min_oil_prod_l_ha',
+                        'max_oil_prod_l_ha', 'avg_oil_prod_l_ha', 'l_per_t',
+                        'min_l_per_t', 'max_l_per_t', 'avg_l_per_t']
+
+    techniques = ['tradizionale', 'intensiva', 'superintensiva']
+
+    for variety in all_varieties:
+        for feature in variety_features:
+            feature_names.append(f"{variety}_{feature}")
+        for technique in techniques:
+            feature_names.append(f"{variety}_tech_{technique}")
+
+    return feature_names
+
+def add_controlled_variation(base_value: float, max_variation_pct: float = 0.20) -> float:
+    """
+    Aggiunge una variazione controllata a un valore base.
+
+    Parameters
+    ----------
+    base_value : float
+        Valore base da modificare
+    max_variation_pct : float
+        Percentuale massima di variazione (default 20%)
+
+    Returns
+    -------
+    float
+        Valore con variazione applicata
+    """
+    variation = np.random.uniform(-max_variation_pct, max_variation_pct)
+    return base_value * (1 + variation)

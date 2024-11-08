@@ -5,12 +5,17 @@
             {
                 "variety": "Nocellara dell'Etna",
                 "technique": "Tradizionale",
-                "percentage": 70
+                "percentage": 30
             },
             {
                 "variety": "Frantoio",
                 "technique": "Tradizionale",
                 "percentage": 30
+            },
+            {
+                "variety": "Coratina",
+                "technique": "Tradizionale",
+                "percentage": 40
             }
         ]
     },
@@ -18,12 +23,14 @@
         "fixed": {
             "ammortamento": 2000,
             "assicurazione": 500,
-            "manutenzione": 800
+            "manutenzione": 800,
+            "certificazioni": 3000
         },
         "variable": {
             "raccolta": 0.35,
             "potatura": 600,
-            "fertilizzanti": 400
+            "fertilizzanti": 400,
+            "irrigazione": 300
         },
         "transformation": {
             "molitura": 0.15,
@@ -31,6 +38,11 @@
             "bottiglia": 1.2,
             "etichettatura": 0.3
         },
-        "selling_price": 12
+        "marketing": {
+            "budget_annuale": 15000,
+            "costi_commerciali": 0.5,
+            "prezzo_vendita": 12,
+            "perc_vendita_diretta": 30
+        }
     }
 }
