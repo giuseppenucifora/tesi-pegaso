@@ -1,7 +1,0 @@
-Metadata-Version: 2.1
-Name: olive_oil_dashboard
-Version: 0.1
-Requires-Dist: pandas
-Requires-Dist: numpy
-Requires-Dist: tensorflow
-Requires-Dist: scikit-learn
