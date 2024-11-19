@@ -2,8 +2,10 @@ import psutil
 import multiprocessing
 import re
 import pandas as pd
-from typing import List, Dict
 import numpy as np
+from typing import List, Dict
+import os
+import joblib
 
 
 def get_optimal_workers() -> int:
@@ -215,12 +217,6 @@ def get_full_data(simulated_data: pd.DataFrame,
 
     return full_data
 
-
-
-
-import numpy as np
-from typing import List, Dict
-
 def prepare_static_features_multiple(varieties_info: List[Dict],
                                      percentages: List[float],
                                      hectares: float,
@@ -377,3 +373,132 @@ def add_controlled_variation(base_value: float, max_variation_pct: float = 0.20)
     """
     variation = np.random.uniform(-max_variation_pct, max_variation_pct)
     return base_value * (1 + variation)
+
+def get_growth_phase(month):
+    if month in [12, 1, 2]:
+        return 'dormancy'
+    elif month in [3, 4, 5]:
+        return 'flowering'
+    elif month in [6, 7, 8]:
+        return 'fruit_set'
+    else:
+        return 'ripening'
+
+def calculate_weather_effect(row, optimal_temp):
+    # Effetti base
+    temp_effect = -0.1 * (row['temp_mean'] - optimal_temp) ** 2
+    rain_effect = -0.05 * (row['precip_sum'] - 600) ** 2 / 10000
+    sun_effect = 0.1 * row['solarenergy_sum'] / 1000
+
+    # Fattori di scala basati sulla fase di crescita
+    if row['growth_phase'] == 'dormancy':
+        temp_scale = 0.5
+        rain_scale = 0.2
+        sun_scale = 0.1
+    elif row['growth_phase'] == 'flowering':
+        temp_scale = 2.0
+        rain_scale = 1.5
+        sun_scale = 1.0
+    elif row['growth_phase'] == 'fruit_set':
+        temp_scale = 1.5
+        rain_scale = 1.0
+        sun_scale = 0.8
+    else:  # ripening
+        temp_scale = 1.0
+        rain_scale = 0.5
+        sun_scale = 1.2
+
+    # Calcolo dell'effetto combinato
+    combined_effect = (
+            temp_scale * temp_effect +
+            rain_scale * rain_effect +
+            sun_scale * sun_effect
+    )
+
+    # Aggiustamenti specifici per fase
+    if row['growth_phase'] == 'flowering':
+        combined_effect -= 0.5 * max(0, row['precip_sum'] - 50)  # Penalità per pioggia eccessiva durante la fioritura
+    elif row['growth_phase'] == 'fruit_set':
+        combined_effect += 0.3 * max(0, row['temp_mean'] - (optimal_temp + 5))  # Bonus per temperature più alte durante la formazione dei frutti
+
+    return combined_effect
+
+def calculate_water_need(weather_data, base_need, optimal_temp):
+    # Calcola il fabbisogno idrico basato su temperatura e precipitazioni
+    temp_factor = 1 + 0.05 * (weather_data['temp_mean'] - optimal_temp)  # Aumenta del 5% per ogni grado sopra l'ottimale
+    rain_factor = 1 - 0.001 * weather_data['precip_sum']  # Diminuisce leggermente con l'aumentare delle precipitazioni
+    return base_need * temp_factor * rain_factor
+
+def create_technique_mapping(olive_varieties, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+    # Estrai tutte le tecniche uniche dal dataset e convertile in lowercase
+    all_techniques = olive_varieties['Tecnica di Coltivazione'].str.lower().unique()
+
+    # Crea il mapping partendo da 1
+    technique_mapping = {tech: i + 1 for i, tech in enumerate(sorted(all_techniques))}
+
+    # Salva il mapping
+    os.makedirs(os.path.dirname(mapping_path), exist_ok=True)
+    joblib.dump(technique_mapping, mapping_path)
+
+    return technique_mapping
+
+
+def encode_techniques(df, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+    if not os.path.exists(mapping_path):
+        raise FileNotFoundError(f"Mapping not found at {mapping_path}. Run create_technique_mapping first.")
+
+    technique_mapping = joblib.load(mapping_path)
+
+    # Trova tutte le colonne delle tecniche
+    tech_columns = [col for col in df.columns if col.endswith('_tech')]
+
+    # Applica il mapping a tutte le colonne delle tecniche
+    for col in tech_columns:
+        df[col] = df[col].str.lower().map(technique_mapping).fillna(0).astype(int)
+
+    return df
+
+
+def decode_techniques(df, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+    if not os.path.exists(mapping_path):
+        raise FileNotFoundError(f"Mapping not found at {mapping_path}")
+
+    technique_mapping = joblib.load(mapping_path)
+    reverse_mapping = {v: k for k, v in technique_mapping.items()}
+    reverse_mapping[0] = ''  # Aggiungi un mapping per 0 a stringa vuota
+
+    # Trova tutte le colonne delle tecniche
+    tech_columns = [col for col in df.columns if col.endswith('_tech')]
+
+    # Applica il reverse mapping a tutte le colonne delle tecniche
+    for col in tech_columns:
+        df[col] = df[col].map(reverse_mapping)
+
+    return df
+
+
+def decode_single_technique(technique_value, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+    if not os.path.exists(mapping_path):
+        raise FileNotFoundError(f"Mapping not found at {mapping_path}")
+
+    technique_mapping = joblib.load(mapping_path)
+    reverse_mapping = {v: k for k, v in technique_mapping.items()}
+    reverse_mapping[0] = ''
+
+    return reverse_mapping.get(technique_value, '')
+
+def preprocess_weather_data(weather_df):
+    # Calcola statistiche mensili per ogni anno
+    monthly_weather = weather_df.groupby(['year', 'month']).agg({
+        'temp': ['mean', 'min', 'max'],
+        'humidity': 'mean',
+        'precip': 'sum',
+        'windspeed': 'mean',
+        'cloudcover': 'mean',
+        'solarradiation': 'sum',
+        'solarenergy': 'sum',
+        'uvindex': 'max'
+    }).reset_index()
+
+    monthly_weather.columns = ['year', 'month'] + [f'{col[0]}_{col[1]}' for col in monthly_weather.columns[2:]]
+    return monthly_weather
