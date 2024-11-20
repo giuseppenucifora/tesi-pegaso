@@ -1,0 +1,6 @@
+[core]
+    autostage = true
+    remote = storage
+['remote "storage"']
+    url = s3://olive-oil-dataset
+    region = eu-west-1

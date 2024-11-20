@@ -429,7 +429,7 @@ def calculate_water_need(weather_data, base_need, optimal_temp):
     rain_factor = 1 - 0.001 * weather_data['precip_sum']  # Diminuisce leggermente con l'aumentare delle precipitazioni
     return base_need * temp_factor * rain_factor
 
-def create_technique_mapping(olive_varieties, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+def create_technique_mapping(olive_varieties, mapping_path='./sources/technique_mapping.joblib'):
     # Estrai tutte le tecniche uniche dal dataset e convertile in lowercase
     all_techniques = olive_varieties['Tecnica di Coltivazione'].str.lower().unique()
 
@@ -443,7 +443,7 @@ def create_technique_mapping(olive_varieties, mapping_path='./kaggle/working/mod
     return technique_mapping
 
 
-def encode_techniques(df, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+def encode_techniques(df, mapping_path='./sources/technique_mapping.joblib'):
     if not os.path.exists(mapping_path):
         raise FileNotFoundError(f"Mapping not found at {mapping_path}. Run create_technique_mapping first.")
 
@@ -459,7 +459,7 @@ def encode_techniques(df, mapping_path='./kaggle/working/models/technique_mappin
     return df
 
 
-def decode_techniques(df, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+def decode_techniques(df, mapping_path='./sources/technique_mapping.joblib'):
     if not os.path.exists(mapping_path):
         raise FileNotFoundError(f"Mapping not found at {mapping_path}")
 
@@ -477,7 +477,7 @@ def decode_techniques(df, mapping_path='./kaggle/working/models/technique_mappin
     return df
 
 
-def decode_single_technique(technique_value, mapping_path='./kaggle/working/models/technique_mapping.joblib'):
+def decode_single_technique(technique_value, mapping_path='./sources/technique_mapping.joblib'):
     if not os.path.exists(mapping_path):
         raise FileNotFoundError(f"Mapping not found at {mapping_path}")
 
