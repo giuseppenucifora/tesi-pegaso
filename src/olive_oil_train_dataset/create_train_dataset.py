@@ -434,7 +434,7 @@ def parse_arguments():
     parser.add_argument(
         '--random-seed',
         type=int,
-        default=42,
+        default=None,
         help='Seed per la riproducibilità dei risultati'
     )
 
@@ -484,7 +484,7 @@ if __name__ == "__main__":
 
     # Carica dati
     try:
-        weather_data = pd.read_parquet('./sources/weather_data_complete.parquet')
+        weather_data = pd.read_parquet('./sources/weather_data_solarenergy.parquet')
         olive_varieties = pd.read_parquet('./sources/olive_varieties.parquet')
     except Exception as e:
         print(f"Errore nel caricamento dei dati: {str(e)}")
