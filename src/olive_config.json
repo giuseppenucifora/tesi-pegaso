@@ -4,17 +4,17 @@
         "varieties": [
             {
                 "variety": "Nocellara dell'Etna",
-                "technique": "Tradizionale",
+                "technique": "intensiva",
                 "percentage": 30
             },
             {
                 "variety": "Frantoio",
-                "technique": "Tradizionale",
+                "technique": "tradizionale",
                 "percentage": 30
             },
             {
                 "variety": "Coratina",
-                "technique": "Tradizionale",
+                "technique": "superintensiva",
                 "percentage": 40
             }
         ]

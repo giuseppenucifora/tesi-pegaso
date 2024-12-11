@@ -1,16 +1,27 @@
 import plotly.express as px
 from dash import Dash, dcc, html, Input, Output, State, callback_context
 import tensorflow as tf
+import keras
 import joblib
 import dash_bootstrap_components as dbc
 import os
 import json
 from utils.helpers import clean_column_name
 from dashboard.environmental_simulator import *
-
-DEV_MODE = os.getenv('DEV_MODE', 'True').lower() == 'true'
+from dotenv import load_dotenv
+import sagemaker
+from sagemaker.tensorflow import TensorFlowModel
+from sagemaker.serverless import ServerlessInferenceConfig
+from sagemaker import Session
+import boto3
 
 CONFIG_FILE = 'olive_config.json'
+
+# Reduce TensorFlow logging verbosity
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Set global precision policy
+tf.keras.mixed_precision.set_global_policy('float32')
 
 
 def load_config():
@@ -67,24 +78,151 @@ def save_config(config):
         return False
 
 
-# Caricamento dati
-print("Inizializzazione della dashboard...")
-
 try:
-    # Caricamento dati e modello
-    print("Caricamento dati...")
-    simulated_data = pd.read_parquet("../sources/simulated_data.parquet")
-    weather_data = pd.read_parquet("../sources/weather_data_complete.parquet")
-    olive_varieties = pd.read_parquet("../sources/olive_varieties.parquet")
-    if not DEV_MODE:
+    simulated_data = pd.read_parquet("./sources/olive_training_dataset.parquet")
+    weather_data = pd.read_parquet("./sources/weather_data_solarenergy.parquet")
+    olive_varieties = pd.read_parquet("./sources/olive_varieties.parquet")
+    if not True:
+
+        # Print versions and system information
+        print(f"Keras version: {keras.__version__}")
+        print(f"TensorFlow version: {tf.__version__}")
+        print(f"CUDA available: {tf.test.is_built_with_cuda()}")
+        print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
+
+        # GPU memory configuration
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+
+                logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+                print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+            except RuntimeError as e:
+                print(e)
+
+
+        @keras.saving.register_keras_serializable()
+        class DataAugmentation(tf.keras.layers.Layer):
+            """Custom layer per l'augmentation dei dati"""
+
+            def __init__(self, noise_stddev=0.03, **kwargs):
+                super().__init__(**kwargs)
+                self.noise_stddev = noise_stddev
+
+            def call(self, inputs, training=None):
+                if training:
+                    return inputs + tf.random.normal(
+                        shape=tf.shape(inputs),
+                        mean=0.0,
+                        stddev=self.noise_stddev
+                    )
+                return inputs
+
+            def get_config(self):
+                config = super().get_config()
+                config.update({"noise_stddev": self.noise_stddev})
+                return config
+
+
+        @keras.saving.register_keras_serializable()
+        class PositionalEncoding(tf.keras.layers.Layer):
+            """Custom layer per l'encoding posizionale"""
+
+            def __init__(self, d_model, **kwargs):
+                super().__init__(**kwargs)
+                self.d_model = d_model
+
+            def build(self, input_shape):
+                _, seq_length, _ = input_shape
+
+                # Crea la matrice di encoding posizionale
+                position = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
+                div_term = tf.exp(
+                    tf.range(0, self.d_model, 2, dtype=tf.float32) *
+                    (-tf.math.log(10000.0) / self.d_model)
+                )
+
+                # Calcola sin e cos
+                pos_encoding = tf.zeros((1, seq_length, self.d_model))
+                pos_encoding_even = tf.sin(position * div_term)
+                pos_encoding_odd = tf.cos(position * div_term)
+
+                # Assegna i valori alle posizioni pari e dispari
+                pos_encoding = tf.concat(
+                    [tf.expand_dims(pos_encoding_even, -1),
+                     tf.expand_dims(pos_encoding_odd, -1)],
+                    axis=-1
+                )
+                pos_encoding = tf.reshape(pos_encoding, (1, seq_length, -1))
+                pos_encoding = pos_encoding[:, :, :self.d_model]
+
+                # Salva l'encoding come peso non trainabile
+                self.pos_encoding = self.add_weight(
+                    shape=(1, seq_length, self.d_model),
+                    initializer=tf.keras.initializers.Constant(pos_encoding),
+                    trainable=False,
+                    name='positional_encoding'
+                )
+
+                super().build(input_shape)
+
+            def call(self, inputs):
+                # Broadcast l'encoding posizionale sul batch
+                batch_size = tf.shape(inputs)[0]
+                pos_encoding_tiled = tf.tile(self.pos_encoding, [batch_size, 1, 1])
+                return inputs + pos_encoding_tiled
+
+            def get_config(self):
+                config = super().get_config()
+                config.update({"d_model": self.d_model})
+                return config
+
+
+        @keras.saving.register_keras_serializable()
+        class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+            """Custom learning rate schedule with linear warmup and exponential decay."""
+
+            def __init__(self, initial_learning_rate=1e-3, warmup_steps=500, decay_steps=5000):
+                super().__init__()
+                self.initial_learning_rate = initial_learning_rate
+                self.warmup_steps = warmup_steps
+                self.decay_steps = decay_steps
+
+            def __call__(self, step):
+                warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
+                warmup_lr = self.initial_learning_rate * warmup_pct
+                decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
+                decayed_lr = self.initial_learning_rate * decay_factor
+                return tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
+
+            def get_config(self):
+                return {
+                    'initial_learning_rate': self.initial_learning_rate,
+                    'warmup_steps': self.warmup_steps,
+                    'decay_steps': self.decay_steps
+                }
+
+
+        @keras.saving.register_keras_serializable()
+        def weighted_huber_loss(y_true, y_pred):
+            # Pesi per diversi output
+            weights = tf.constant([1.0, 0.8, 0.8, 1.0, 0.6], dtype=tf.float32)
+            huber = tf.keras.losses.Huber(delta=1.0)
+            loss = huber(y_true, y_pred)
+            weighted_loss = tf.reduce_mean(loss * weights)
+            return weighted_loss
+
 
         print("Caricamento modello e scaler...")
-        model = tf.keras.models.load_model('./models/oli_transformer/olive_transformer.keras')
+        model = tf.keras.models.load_model('./sources/olive_oil_transformer/olive_oil_transformer_model.keras')
 
-        scaler_temporal = joblib.load('../old_model_train/models/oli_transformer/scaler_temporal.joblib')
-        scaler_static = joblib.load('../old_model_train/models/oli_transformer/scaler_static.joblib')
-        scaler_y = joblib.load('../old_model_train/models/oli_transformer/scaler_y.joblib')
+        # model.save('./sources/olive_oil_transformer/olive_oil_transformer_model', save_format='tf')
 
+        scaler_temporal = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_temporal.joblib')
+        scaler_static = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_static.joblib')
+        scaler_y = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_y.joblib')
     else:
         print("Modalità sviluppo attiva - Modelli non caricati")
 
@@ -184,65 +322,55 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares, all_
     return np.array(static_features).reshape(1, -1)
 
 
-def mock_make_prediction(weather_data, varieties_info, percentages, hectares):
-    """
-    Versione mock della funzione make_prediction che simula risultati realistici
-    basati sui dati reali delle varietà e tiene conto degli ettari
-    """
+def mock_make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data=None):
     try:
-        # Calcola la produzione di olive basata sui dati reali delle varietà per ettaro
-        olive_production_per_ha = sum(
-            variety_info['Produzione (tonnellate/ettaro)'] * 1000 * (percentage / 100)
-            for variety_info, percentage in zip(varieties_info, percentages)
-        )
+        # Debug info
+        print("Inizio mock_make_prediction")
+        print(f"Varietà info: {len(varieties_info)}")
+        print(f"Percentuali: {percentages}")
+        print(f"Ettari: {hectares}")
 
-        # Applica il fattore ettari
-        olive_production = olive_production_per_ha * hectares
+        # Inizializza le variabili ambientali dai dati storici
+        avg_temp = weather_data['temp'].mean()
+        avg_radiation = weather_data['solarradiation'].mean()
+        stress_factor = 1.0
 
-        # Aggiungi una variabilità realistica basata sulle condizioni meteorologiche recenti
-        recent_weather = weather_data.tail(3)
-        weather_factor = 1.0
+        if simulation_data is not None:
+            print("Usando dati dalla simulazione ambientale")
+            avg_stress = simulation_data['stress_index'].mean()
+            stress_factor = 1.0 - (avg_stress * 0.5)  # Riduce fino al 50%
+            print(f"Fattore di stress dalla simulazione: {stress_factor:.2f}")
 
-        # Temperatura influenza la produzione
-        avg_temp = recent_weather['temp'].mean()
-        if avg_temp < 15:
-            weather_factor *= 0.9
-        elif avg_temp > 25:
-            weather_factor *= 0.95
+            # Aggiorna valori ambientali
+            avg_temp = simulation_data['temperature'].mean()
+            if 'radiation' in simulation_data.columns:
+                avg_radiation = simulation_data['radiation'].mean()
+        else:
+            print("Usando dati meteorologici storici")
+            # Calcola stress base dai dati storici
+            recent_weather = weather_data.tail(3)
+            avg_temp = recent_weather['temp'].mean()
 
-        # Precipitazioni influenzano la produzione
-        total_precip = recent_weather['precip'].sum()
-        if total_precip < 30:  # Siccità
-            weather_factor *= 0.85
-        elif total_precip > 200:  # Troppa pioggia
-            weather_factor *= 0.9
+            if avg_temp < 15:
+                stress_factor *= 0.9
+            elif avg_temp > 25:
+                stress_factor *= 0.95
 
-        # Radiazione solare influenza la produzione
-        avg_solar = recent_weather['solarradiation'].mean()
-        if avg_solar < 150:
-            weather_factor *= 0.95
+            # Precipitazioni influenzano la produzione
+            total_precip = recent_weather['precip'].sum()
+            if total_precip < 30:  # Siccità
+                stress_factor *= 0.85
+            elif total_precip > 200:  # Troppa pioggia
+                stress_factor *= 0.9
 
-        # Applica il fattore meteorologico alla produzione totale
-        olive_production = olive_production * weather_factor
+            # Radiazione solare
+            avg_solar = recent_weather['solarradiation'].mean()
+            if avg_solar < 150:
+                stress_factor *= 0.95
 
-        # Calcola la produzione di olio basata sulle rese delle varietà
-        oil_per_ha = 0
-        oil_total = 0
+        print(f"Fattore di stress finale: {stress_factor}")
 
-        for variety_info, percentage in zip(varieties_info, percentages):
-            # Calcolo della produzione di olio per ettaro per questa varietà
-            variety_oil_per_ha = variety_info['Produzione Olio (litri/ettaro)'] * (percentage / 100)
-            oil_per_ha += variety_oil_per_ha
-
-            # Calcolo della produzione totale di olio per questa varietà
-            variety_oil_total = variety_oil_per_ha * hectares
-            oil_total += variety_oil_total
-
-        # Applica il fattore meteorologico anche alla produzione di olio
-        oil_total = oil_total * weather_factor
-        oil_per_ha = oil_per_ha * weather_factor
-
-        # Calcola il fabbisogno idrico considerando la stagione attuale e gli ettari
+        # Calcola la produzione di olive basata sui dati reali delle varietà
         current_month = datetime.now().month
         seasons = {
             'Primavera': [3, 4, 5],
@@ -250,7 +378,6 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares):
             'Autunno': [9, 10, 11],
             'Inverno': [12, 1, 2]
         }
-
         current_season = next(season for season, months in seasons.items()
                               if current_month in months)
 
@@ -261,46 +388,68 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares):
             'Inverno': 'Fabbisogno Acqua Inverno (m³/ettaro)'
         }
 
-        # Calcolo del fabbisogno idrico per ettaro
-        water_need_per_ha = sum(
-            variety_info[season_water_need[current_season]] * (percentage / 100)
-            for variety_info, percentage in zip(varieties_info, percentages)
-        )
-
-        # Applica il fattore ettari al fabbisogno idrico
-        total_water_need = water_need_per_ha * hectares
-
-        # Prepara i dettagli per varietà
+        # Calcoli per ogni varietà
         variety_details = []
-        for variety_info, percentage in zip(varieties_info, percentages):
-            variety_prod_per_ha = variety_info['Produzione (tonnellate/ettaro)'] * 1000 * (percentage / 100)
-            variety_prod_total = variety_prod_per_ha * hectares * weather_factor
+        total_water_need = 0
+        total_olive_production = 0
+        total_oil_production = 0
 
-            # Calcolo corretto dell'olio per varietà
-            variety_oil_per_ha = variety_info['Produzione Olio (litri/ettaro)'] * (percentage / 100)
-            variety_oil_total = variety_oil_per_ha * hectares * weather_factor
+        for variety_info, percentage in zip(varieties_info, percentages):
+            print(f"Elaborazione varietà: {variety_info['Varietà di Olive']}")
+
+            # Calcola la produzione di olive per ettaro
+            base_prod_per_ha = float(variety_info['Produzione (tonnellate/ettaro)']) * 1000 * (percentage / 100)
+            prod_per_ha = base_prod_per_ha * stress_factor
+            prod_total = prod_per_ha * hectares
+
+            # Calcola la produzione di olio
+            base_oil_per_ha = float(variety_info['Produzione Olio (litri/ettaro)']) * (percentage / 100)
+            oil_per_ha = base_oil_per_ha * stress_factor
+            oil_total = oil_per_ha * hectares
+
+            # Calcolo fabbisogno idrico
+            water_need = float(variety_info[season_water_need[current_season]]) * (percentage / 100)
+
+            print(f"  Produzione olive/ha: {prod_per_ha:.2f}")
+            print(f"  Produzione olio/ha: {oil_per_ha:.2f}")
+            print(f"  Fabbisogno idrico: {water_need:.2f}")
 
             variety_details.append({
                 'variety': variety_info['Varietà di Olive'],
                 'percentage': percentage,
-                'production_per_ha': variety_prod_per_ha,
-                'production_total': variety_prod_total,
-                'oil_per_ha': variety_oil_per_ha,
-                'oil_total': variety_oil_total,
-                'water_need': variety_info[season_water_need[current_season]] * hectares
+                'production_per_ha': prod_per_ha,
+                'production_total': prod_total,
+                'oil_per_ha': oil_per_ha,
+                'oil_total': oil_total,
+                'water_need': water_need
             })
 
+            total_olive_production += prod_total
+            total_oil_production += oil_total
+            total_water_need += water_need * hectares
+
+        # Calcola medie per ettaro
+        avg_olive_production_ha = total_olive_production / hectares if hectares > 0 else 0
+        avg_oil_production_ha = total_oil_production / hectares if hectares > 0 else 0
+        water_need_ha = total_water_need / hectares if hectares > 0 else 0
+
         return {
-            'olive_production': olive_production_per_ha,
-            'olive_production_total': olive_production,
-            'min_oil_production': oil_per_ha * 0.9,
-            'max_oil_production': oil_per_ha * 1.1,
-            'avg_oil_production': oil_per_ha,
-            'avg_oil_production_total': oil_total,
-            'water_need': water_need_per_ha,
+            'olive_production': avg_olive_production_ha,
+            'olive_production_total': total_olive_production,
+            'min_oil_production': avg_oil_production_ha * 0.9,
+            'max_oil_production': avg_oil_production_ha * 1.1,
+            'avg_oil_production': avg_oil_production_ha,
+            'avg_oil_production_total': total_oil_production,
+            'water_need': water_need_ha,
             'water_need_total': total_water_need,
             'variety_details': variety_details,
-            'hectares': hectares
+            'hectares': hectares,
+            'stress_factor': stress_factor,
+            'environmental_conditions': {
+                'temperature': avg_temp,
+                'radiation': avg_radiation,
+                'data_source': 'simulation' if simulation_data is not None else 'historical'
+            }
         }
 
     except Exception as e:
@@ -308,18 +457,29 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares):
         import traceback
         print("Traceback completo:")
         print(traceback.format_exc())
-        raise e
 
 
-def make_prediction(weather_data, varieties_info, percentages, hectares):
+def make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data=None):
+    DEV_MODE = True
     if DEV_MODE:
-        return mock_make_prediction(weather_data, varieties_info, percentages, hectares)
-    else:
-        """Effettua una predizione usando il modello."""
-        try:
-            print("Inizio della funzione make_prediction")
+        return mock_make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data)
+    try:
+        print("Inizio della funzione make_prediction")
 
-            # Prepara i dati meteorologici mensili
+        # Prepara i dati temporali (meteorologici)
+        temporal_features = ['temp_mean', 'precip_sum', 'solar_energy_sum']
+
+        if simulation_data is not None:
+            # Usa i dati della simulazione
+            print("Usando dati dalla simulazione ambientale")
+            # Calcola le medie dai dati simulati
+            temporal_data = np.array([[
+                simulation_data['temperature'].mean(),
+                simulation_data['rainfall'].sum(),
+                simulation_data['radiation'].mean()
+            ]])
+        else:
+            # Usa i dati meteorologici storici
             monthly_stats = weather_data.groupby(['year', 'month']).agg({
                 'temp': 'mean',
                 'precip': 'sum',
@@ -332,82 +492,160 @@ def make_prediction(weather_data, varieties_info, percentages, hectares):
                 'solarradiation': 'solar_energy_sum'
             })
 
-            print(f"Shape dei dati meteorologici mensili: {monthly_stats.shape}")
+            # Prendi gli ultimi dati meteorologici
+            temporal_data = monthly_stats[temporal_features].tail(1).values
 
-            # Definisci la dimensione della finestra temporale
-            window_size = 41
+        # Calcola il fattore di stress dalla simulazione
+        stress_factor = 1.0
+        if simulation_data is not None:
+            avg_stress = simulation_data['stress_index'].mean()
+            # Applica una penalità basata sullo stress
+            stress_factor = 1.0 - (avg_stress * 0.5)  # Riduce fino al 50% basato sullo stress
+            print(f"Fattore di stress dalla simulazione: {stress_factor:.2f}")
 
-            # Prendi gli ultimi window_size mesi di dati
-            if len(monthly_stats) >= window_size:
-                temporal_data = monthly_stats[['temp_mean', 'precip_sum', 'solar_energy_sum']].values[-window_size:]
+        # Prepara i dati statici
+        static_data = []
+
+        # Aggiungi hectares come prima feature statica
+        static_data.append(hectares)
+
+        # Ottieni tutte le possibili varietà dal dataset di training
+        all_varieties = olive_varieties['Varietà di Olive'].unique()
+        varieties = [clean_column_name(variety) for variety in all_varieties]
+
+        # Per ogni varietà possibile nel dataset
+        for variety in varieties:
+            # Trova se questa varietà è tra quelle selezionate
+            selected_variety = None
+            selected_idx = None
+
+            for idx, info in enumerate(varieties_info):
+                if clean_column_name(info['Varietà di Olive']) == variety:
+                    selected_variety = info
+                    selected_idx = idx
+                    break
+
+            if selected_variety is not None:
+                percentage = percentages[selected_idx] / 100  # Converti in decimale
+
+                # Aggiungi tutte le feature numeriche della varietà
+                static_data.extend([
+                    percentage,  # pct
+                    float(selected_variety['Produzione (tonnellate/ettaro)']),  # prod_t_ha
+                    float(selected_variety['Produzione Olio (tonnellate/ettaro)']),  # oil_prod_t_ha
+                    float(selected_variety['Produzione Olio (litri/ettaro)']),  # oil_prod_l_ha
+                    float(selected_variety['Min % Resa']),  # min_yield_pct
+                    float(selected_variety['Max % Resa']),  # max_yield_pct
+                    float(selected_variety['Min Produzione Olio (litri/ettaro)']),  # min_oil_prod_l_ha
+                    float(selected_variety['Max Produzione Olio (litri/ettaro)']),  # max_oil_prod_l_ha
+                    float(selected_variety['Media Produzione Olio (litri/ettaro)']),  # avg_oil_prod_l_ha
+                    float(selected_variety['Litri per Tonnellata']),  # l_per_t
+                    float(selected_variety['Min Litri per Tonnellata']),  # min_l_per_t
+                    float(selected_variety['Max Litri per Tonnellata']),  # max_l_per_t
+                    float(selected_variety['Media Litri per Tonnellata'])  # avg_l_per_t
+                ])
+
+                # Aggiungi le feature binarie per la tecnica
+                tech = str(selected_variety['Tecnica di Coltivazione']).lower()
+                static_data.extend([
+                    1 if tech == 'tradizionale' else 0,
+                    1 if tech == 'intensiva' else 0,
+                    1 if tech == 'superintensiva' else 0
+                ])
             else:
-                raise ValueError(f"Non ci sono abbastanza dati meteorologici. Necessari almeno {window_size} mesi.")
+                # Se la varietà non è selezionata, aggiungi zeri per tutte le sue feature
+                static_data.extend([0] * 13)  # Feature numeriche
+                static_data.extend([0] * 3)  # Feature tecniche binarie
 
-            print(f"Shape dei dati temporali prima della trasformazione: {temporal_data.shape}")
+        # Converti in array numpy e reshape
+        temporal_data = np.array(temporal_data).reshape(1, 1, -1)  # (1, 1, n_temporal_features)
+        static_data = np.array(static_data).reshape(1, -1)  # (1, n_static_features)
 
-            temporal_data = scaler_temporal.transform(temporal_data)
-            print(f"Shape dei dati temporali dopo la trasformazione: {temporal_data.shape}")
+        print(f"Shape dei dati temporali: {temporal_data.shape}")
+        print(f"Shape dei dati statici: {static_data.shape}")
 
-            temporal_data = np.expand_dims(temporal_data, axis=0)
-            print(f"Shape finale dei dati temporali: {temporal_data.shape}")
+        # Debug info
+        print("Static data:")
+        print(static_data)
+        print("\nTemporal data:")
+        print(temporal_data)
 
-            all_varieties = olive_varieties['Varietà di Olive'].unique()
-            varieties = [clean_column_name(variety) for variety in all_varieties]
+        # Standardizza i dati
+        temporal_data = scaler_temporal.transform(temporal_data.reshape(1, -1)).reshape(1, 1, -1)
+        static_data = scaler_static.transform(static_data)
 
-            # Prepara i dati statici
-            print("Preparazione dei dati statici")
-            static_data = prepare_static_features_multiple(varieties_info, percentages, hectares, varieties)
+        # Prepara il dizionario di input per il modello
+        input_data = {
+            'temporal': temporal_data,
+            'static': static_data
+        }
 
-            # Verifica che il numero di feature statiche sia corretto
-            if static_data.shape[1] != scaler_static.n_features_in_:
-                print("ATTENZIONE: Il numero di feature statiche non corrisponde a quello atteso dallo scaler!")
-                print(f"Feature generate: {static_data.shape[1]}, Feature attese: {scaler_static.n_features_in_}")
+        # Effettua la predizione
+        prediction = model.predict(input_data)
+        prediction = scaler_y.inverse_transform(prediction)[0]
 
-            static_data = scaler_static.transform(static_data)
-            print(f"Shape dei dati statici dopo la trasformazione: {static_data.shape}")
+        # Applica il fattore di stress se disponibile
+        if simulation_data is not None:
+            prediction = prediction * stress_factor
 
-            # Effettua la predizione
-            print("Effettuazione della predizione")
-            prediction = model.predict({'temporal': temporal_data, 'static': static_data})
-            prediction = scaler_y.inverse_transform(prediction)[0]
+        # Calcola i dettagli per varietà
+        variety_details = []
+        total_water_need = 0
 
-            # Calcola i dettagli per varietà
-            variety_details = []
-            for variety_info, percentage in zip(varieties_info, percentages):
-                # Calcoli specifici per varietà
-                prod_per_ha = variety_info['Produzione (tonnellate/ettaro)'] * 1000
-                oil_per_ha = variety_info['Produzione Olio (litri/ettaro)']
-                water_need = (
-                                     variety_info['Fabbisogno Acqua Primavera (m³/ettaro)'] +
-                                     variety_info['Fabbisogno Acqua Estate (m³/ettaro)'] +
-                                     variety_info['Fabbisogno Acqua Autunno (m³/ettaro)'] +
-                                     variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']
-                             ) / 4
+        for variety_info, percentage in zip(varieties_info, percentages):
+            # Calcoli specifici per varietà
+            prod_per_ha = float(variety_info['Produzione (tonnellate/ettaro)']) * 1000 * (percentage / 100)
+            if simulation_data is not None:
+                prod_per_ha *= stress_factor
+            prod_total = prod_per_ha * hectares
 
-                variety_details.append({
-                    'variety': variety_info['Varietà di Olive'],
-                    'percentage': percentage,
-                    'production_per_ha': prod_per_ha,
-                    'oil_per_ha': oil_per_ha,
-                    'water_need': water_need
-                })
+            oil_per_ha = float(variety_info['Produzione Olio (litri/ettaro)']) * (percentage / 100)
+            if simulation_data is not None:
+                oil_per_ha *= stress_factor
+            oil_total = oil_per_ha * hectares
 
-            return {
-                'olive_production': prediction[0],
-                'min_oil_production': prediction[1],
-                'max_oil_production': prediction[2],
-                'avg_oil_production': prediction[3],
-                'water_need': prediction[4],
-                'variety_details': variety_details
-            }
+            # Calcolo fabbisogno idrico medio
+            water_need = (
+                                 float(variety_info['Fabbisogno Acqua Primavera (m³/ettaro)']) +
+                                 float(variety_info['Fabbisogno Acqua Estate (m³/ettaro)']) +
+                                 float(variety_info['Fabbisogno Acqua Autunno (m³/ettaro)']) +
+                                 float(variety_info['Fabbisogno Acqua Inverno (m³/ettaro)'])
+                         ) / 4 * (percentage / 100)
 
-        except Exception as e:
-            print(f"Errore durante la preparazione dei dati o la predizione: {str(e)}")
-            print(f"Tipo di errore: {type(e).__name__}")
-            import traceback
-            print("Traceback completo:")
-            print(traceback.format_exc())
-            raise e
+            total_water_need += water_need * hectares
+
+            variety_details.append({
+                'variety': variety_info['Varietà di Olive'],
+                'percentage': percentage,
+                'production_per_ha': prod_per_ha,
+                'production_total': prod_total,
+                'oil_per_ha': oil_per_ha,
+                'oil_total': oil_total,
+                'water_need': water_need,
+                'stress_factor': stress_factor if simulation_data is not None else 1.0
+            })
+
+        return {
+            'olive_production': prediction[0],  # kg/ha
+            'olive_production_total': prediction[0] * hectares,  # kg totali
+            'min_oil_production': prediction[1],  # L/ha
+            'max_oil_production': prediction[2],  # L/ha
+            'avg_oil_production': prediction[3],  # L/ha
+            'avg_oil_production_total': prediction[3] * hectares,  # L totali
+            'water_need': prediction[4],  # m³/ha
+            'water_need_total': total_water_need,  # m³ totali
+            'variety_details': variety_details,
+            'hectares': hectares,
+            'stress_factor': stress_factor if simulation_data is not None else 1.0
+        }
+
+    except Exception as e:
+        print(f"Errore durante la preparazione dei dati o la predizione: {str(e)}")
+        print(f"Tipo di errore: {type(e).__name__}")
+        import traceback
+        print("Traceback completo:")
+        print(traceback.format_exc())
+        raise e
 
 
 def create_phase_card(phase: str, data: dict) -> dbc.Card:
@@ -634,9 +872,9 @@ def create_configuration_tab():
                                         dcc.Dropdown(
                                             id='technique-1-dropdown',
                                             options=[
-                                                {'label': 'Tradizionale', 'value': 'Tradizionale'},
-                                                {'label': 'Intensiva', 'value': 'Intensiva'},
-                                                {'label': 'Superintensiva', 'value': 'Superintensiva'}
+                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
+                                                {'label': 'Intensiva', 'value': 'intensiva'},
+                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
                                             ],
                                             value='Tradizionale',
                                             className="mb-2"
@@ -675,9 +913,9 @@ def create_configuration_tab():
                                         dcc.Dropdown(
                                             id='technique-2-dropdown',
                                             options=[
-                                                {'label': 'Tradizionale', 'value': 'Tradizionale'},
-                                                {'label': 'Intensiva', 'value': 'Intensiva'},
-                                                {'label': 'Superintensiva', 'value': 'Superintensiva'}
+                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
+                                                {'label': 'Intensiva', 'value': 'intensiva'},
+                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
                                             ],
                                             value=None,
                                             disabled=True,
@@ -718,9 +956,9 @@ def create_configuration_tab():
                                         dcc.Dropdown(
                                             id='technique-3-dropdown',
                                             options=[
-                                                {'label': 'Tradizionale', 'value': 'Tradizionale'},
-                                                {'label': 'Intensiva', 'value': 'Intensiva'},
-                                                {'label': 'Superintensiva', 'value': 'Superintensiva'}
+                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
+                                                {'label': 'Intensiva', 'value': 'intensiva'},
+                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
                                             ],
                                             value=None,
                                             disabled=True,
@@ -751,6 +989,12 @@ def create_configuration_tab():
                     ])
                 ], className="mb-4")
             ], md=6),
+            # Sezione SageMaker
+            dbc.Row([
+                dbc.Col([
+                    create_sagemaker_config_section()
+                ], md=12)
+            ]),
             # Configurazione Costi
             html.Div([
                 dbc.Button(
@@ -766,6 +1010,60 @@ def create_configuration_tab():
             ], className="text-center")
         ])
     ], label="Configurazione", tab_id="tab-config")
+
+
+@app.callback(
+    [Output('sagemaker-status', 'children'),
+     Output('sagemaker-endpoint', 'children'),
+     Output('sagemaker-latency', 'children'),
+     Output('sagemaker-requests', 'children')],
+    [Input('sagemaker-switch', 'value')],
+    [State('sagemaker-memory', 'value'),
+     State('sagemaker-concurrency', 'value'),
+     State('sagemaker-model-uri', 'value'),
+     State('sagemaker-role', 'value')]
+)
+def toggle_sagemaker(enabled, memory, concurrency, model_uri, role):
+    if not enabled:
+        return (
+            dbc.Alert("Servizio non attivo", color="warning"),
+            "N/A",
+            "N/A",
+            "N/A"
+        )
+    else:
+        try:
+            boto3.setup_default_session(profile_name="giuseppenucifora", region_name="eu-west-1")
+            session = Session()
+            # Inizializza SageMaker
+            tf_model = TensorFlowModel(
+                model_data=model_uri,
+                role=role,
+                framework_version="2.14"
+            )
+
+            serverless_config = ServerlessInferenceConfig(
+                memory_size_in_mb=memory,
+                max_concurrency=concurrency,
+            )
+
+            # Deploy del modello
+            predictor = tf_model.deploy(serverless_inference_config=serverless_config)
+
+            return (
+                dbc.Alert("Servizio attivo", color="success"),
+                predictor.endpoint_name,
+                "< 100ms",
+                "0"
+            )
+        except Exception as e:
+            print(f"Errore nell'attivazione di SageMaker: {str(e)}")
+            return (
+                dbc.Alert(f"Errore: {str(e)}", color="danger"),
+                "Errore",
+                "Errore",
+                "Errore"
+            )
 
 
 def create_economic_analysis_tab():
@@ -902,6 +1200,80 @@ def create_economic_analysis_tab():
 
 def create_production_tab():
     return dbc.Tab([
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.H4("Simulatore Condizioni Ambientali",
+                                className="text-primary mb-0")
+                    ]),
+                    dbc.CardBody([
+                        # Controlli simulazione
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Temperatura (°C)"),
+                                dcc.RangeSlider(
+                                    id='temp-slider',
+                                    min=0,
+                                    max=40,
+                                    step=0.5,
+                                    value=[15, 25],
+                                    marks={i: f'{i}°C' for i in range(0, 41, 5)}
+                                ),
+                            ], md=6),
+                            dbc.Col([
+                                dbc.Label("Umidità (%)"),
+                                dcc.Slider(
+                                    id='humidity-slider',
+                                    min=0,
+                                    max=100,
+                                    step=5,
+                                    value=60,
+                                    marks={i: f'{i}%' for i in range(0, 101, 10)}
+                                ),
+                            ], md=6),
+                        ], className="mb-4"),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Precipitazioni (mm/mese)"),
+                                dbc.Input(
+                                    id='rainfall-input',
+                                    type='number',
+                                    value=50,
+                                    min=0,
+                                    max=500,
+                                    className="mb-2"
+                                ),
+                            ], md=6),
+                            dbc.Col([
+                                dbc.Label("Radiazione Solare (W/m²)"),
+                                dbc.Input(
+                                    id='radiation-input',
+                                    type='number',
+                                    value=250,
+                                    min=0,
+                                    max=1000,
+                                    className="mb-2"
+                                ),
+                            ], md=6),
+                        ], className="mb-4"),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Button(
+                                    [
+                                        html.I(className="fas fa-play me-2"),
+                                        "Avvia Simulazione"
+                                    ],
+                                    id="simulate-btn",
+                                    color="primary",
+                                    className="w-100"
+                                ),
+                            ], md=12),
+                        ]),
+                    ]),
+                ], className="mb-4"),
+            ], md=12),
+        ]),
         # Metriche principali
         dbc.Row([
             dbc.Col([
@@ -1028,81 +1400,6 @@ def create_production_tab():
 
 def create_environmental_simulation_tab():
     return dbc.Tab([
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader([
-                        html.H4("Simulatore Condizioni Ambientali",
-                                className="text-primary mb-0")
-                    ]),
-                    dbc.CardBody([
-                        # Controlli simulazione
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Label("Temperatura (°C)"),
-                                dcc.RangeSlider(
-                                    id='temp-slider',
-                                    min=0,
-                                    max=40,
-                                    step=0.5,
-                                    value=[15, 25],
-                                    marks={i: f'{i}°C' for i in range(0, 41, 5)}
-                                ),
-                            ], md=6),
-                            dbc.Col([
-                                dbc.Label("Umidità (%)"),
-                                dcc.Slider(
-                                    id='humidity-slider',
-                                    min=0,
-                                    max=100,
-                                    step=5,
-                                    value=60,
-                                    marks={i: f'{i}%' for i in range(0, 101, 10)}
-                                ),
-                            ], md=6),
-                        ], className="mb-4"),
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Label("Precipitazioni (mm/mese)"),
-                                dbc.Input(
-                                    id='rainfall-input',
-                                    type='number',
-                                    value=50,
-                                    min=0,
-                                    max=500,
-                                    className="mb-2"
-                                ),
-                            ], md=6),
-                            dbc.Col([
-                                dbc.Label("Radiazione Solare (W/m²)"),
-                                dbc.Input(
-                                    id='radiation-input',
-                                    type='number',
-                                    value=250,
-                                    min=0,
-                                    max=1000,
-                                    className="mb-2"
-                                ),
-                            ], md=6),
-                        ], className="mb-4"),
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Button(
-                                    [
-                                        html.I(className="fas fa-play me-2"),
-                                        "Avvia Simulazione"
-                                    ],
-                                    id="simulate-btn",
-                                    color="primary",
-                                    className="w-100"
-                                ),
-                            ], md=12),
-                        ]),
-                    ]),
-                ], className="mb-4"),
-            ], md=12),
-        ]),
-
         # Container per KPI
         dbc.Row([
             dbc.Col([
@@ -1119,7 +1416,7 @@ def create_environmental_simulation_tab():
                         dcc.Graph(
                             id='growth-simulation-chart',
                             config={'displayModeBar': True,
-                                  'scrollZoom': True}
+                                    'scrollZoom': True}
                         )
                     ])
                 ])
@@ -1532,7 +1829,120 @@ def create_costs_config_section():
     ])
 
 
-# Layout della dashboard modernizzato e responsive
+def create_sagemaker_config_section():
+    return dbc.Card([
+        dbc.CardHeader([
+            html.H4("Configurazione SageMaker", className="text-primary mb-0"),
+            dbc.Switch(
+                id='sagemaker-switch',
+                label="Abilita SageMaker",
+                value=False,
+                className="mt-2"
+            ),
+        ], className="bg-light"),
+        dbc.CardBody([
+            # Stato del servizio
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.H5("Stato Servizio", className="mb-3"),
+                        html.Div(id='sagemaker-status', className="mb-3"),
+                    ])
+                ])
+            ], className="mb-4"),
+
+            # Configurazioni
+            dbc.Row([
+                dbc.Col([
+                    html.H5("Configurazioni", className="mb-3"),
+                    dbc.Form([
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Memoria (MB):", className="fw-bold"),
+                                dbc.Input(
+                                    id='sagemaker-memory',
+                                    type='number',
+                                    min=512,
+                                    max=6144,
+                                    step=512,
+                                    value=2048,
+                                    className="mb-2"
+                                )
+                            ], md=6),
+                            dbc.Col([
+                                dbc.Label("Concorrenza massima:", className="fw-bold"),
+                                dbc.Input(
+                                    id='sagemaker-concurrency',
+                                    type='number',
+                                    min=1,
+                                    max=10,
+                                    value=5,
+                                    className="mb-2"
+                                )
+                            ], md=6),
+                        ]),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Model URI:", className="fw-bold"),
+                                dbc.Input(
+                                    id='sagemaker-model-uri',
+                                    type='text',
+                                    value="s3://sagemaker-oil-transformer/model/saved_model.pb",
+                                    className="mb-2",
+                                    disabled=True,
+                                    style={
+                                        "background-color": "#f8f9fa",
+                                        "opacity": "1",
+                                        "cursor": "not-allowed"
+                                    }
+                                )
+                            ], md=12),
+                        ]),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("IAM Role:", className="fw-bold"),
+                                dbc.Input(
+                                    id='sagemaker-role',
+                                    type='text',
+                                    value="arn:aws:iam::906312666576:role/sagemaker-olive-oil",
+                                    className="mb-2",
+                                    disabled=True,
+                                    style={
+                                        "background-color": "#f8f9fa",
+                                        "opacity": "1",
+                                        "cursor": "not-allowed"
+                                    }
+                                )
+                            ], md=12),
+                        ]),
+                    ])
+                ])
+            ]),
+
+            # Metriche e monitoraggio
+            dbc.Row([
+                dbc.Col([
+                    html.H5("Metriche", className="mb-3"),
+                    dbc.ListGroup([
+                        dbc.ListGroupItem([
+                            html.Strong("Endpoint: "),
+                            html.Span(id='sagemaker-endpoint')
+                        ]),
+                        dbc.ListGroupItem([
+                            html.Strong("Latenza media: "),
+                            html.Span(id='sagemaker-latency')
+                        ]),
+                        dbc.ListGroupItem([
+                            html.Strong("Richieste totali: "),
+                            html.Span(id='sagemaker-requests')
+                        ])
+                    ], flush=True)
+                ])
+            ], className="mt-4")
+        ])
+    ])
+
+
 app.layout = dbc.Container([
     dcc.Location(id='_pages_location'),
     variety2_tooltip,
@@ -1567,6 +1977,9 @@ def create_extra_info_component(prediction, varieties_info):
 
     # Card per ogni varietà
     for detail, variety_info in zip(prediction['variety_details'], varieties_info):
+        # Calcola la resa in modo sicuro
+        resa = (detail['oil_total'] / detail['production_total'] * 100) if detail['production_total'] > 0 else 0
+
         variety_card = dbc.Card([
             dbc.CardHeader(
                 html.H5(f"{detail['variety']} - {detail['percentage']}%",
@@ -1588,12 +2001,11 @@ def create_extra_info_component(prediction, varieties_info):
                                 ], className="px-2 py-1"),
                                 dbc.ListGroupItem([
                                     html.Strong("Resa: "),
-                                    f"{detail['oil_total'] / detail['production_total']:.3f} %"
+                                    f"{resa:.1f}%"
                                 ], className="px-2 py-1")
                             ], flush=True)
                         ])
                     ], md=4),
-                    # Colonna Produzione/ha
                     dbc.Col([
                         html.Div([
                             html.H6("Produzione/ha", className="text-muted mb-3"),
@@ -1609,7 +2021,6 @@ def create_extra_info_component(prediction, varieties_info):
                             ], flush=True)
                         ])
                     ], md=4),
-                    # Colonna Rese
                     dbc.Col([
                         html.Div([
                             html.H6("Caratteristiche", className="text-muted mb-3"),
@@ -1664,6 +2075,12 @@ def create_extra_info_component(prediction, varieties_info):
         ], className="mb-3", style=CARD_STYLE)
         cards.append(variety_card)
 
+    # Calcola la resa media in modo sicuro
+    resa_media = (
+        (prediction['avg_oil_production_total'] / prediction['olive_production_total'] * 100)
+        if prediction['olive_production_total'] > 0 else 0
+    )
+
     # Card riepilogo totali
     summary_card = dbc.Card([
         dbc.CardHeader(
@@ -1683,7 +2100,7 @@ def create_extra_info_component(prediction, varieties_info):
                         ], className="px-2 py-1"),
                         dbc.ListGroupItem([
                             html.Strong("Resa Media: "),
-                            f"{(prediction['avg_oil_production_total'] / prediction['olive_production_total']):.3f}%"
+                            f"{resa_media:.1f}%"
                         ], className="px-2 py-1"),
                         dbc.ListGroupItem([
                             html.Strong("Fabbisogno Idrico: "),
@@ -1953,99 +2370,6 @@ def unified_config_manager(active_tab, variety2, variety3, perc1, perc2, perc3, 
         return [no_update] * 32
 
 
-# Modifica il callback update_dashboard per utilizzare il nuovo layout dei grafici
-@app.callback(
-    [Output('olive-production_ha', 'children'),
-     Output('oil-production_ha', 'children'),
-     Output('water-need_ha', 'children'),
-     Output('olive-production', 'children'),
-     Output('oil-production', 'children'),
-     Output('water-need', 'children'),
-     Output('production-details', 'figure'),
-     Output('weather-impact', 'figure'),
-     Output('water-needs', 'figure'),
-     Output('extra-info', 'children')],
-    [Input('variety-1-dropdown', 'value'),
-     Input('technique-1-dropdown', 'value'),
-     Input('percentage-1-input', 'value'),
-     Input('variety-2-dropdown', 'value'),
-     Input('technique-2-dropdown', 'value'),
-     Input('percentage-2-input', 'value'),
-     Input('variety-3-dropdown', 'value'),
-     Input('technique-3-dropdown', 'value'),
-     Input('percentage-3-input', 'value'),
-     Input('hectares-input', 'value')]
-)
-def update_dashboard(variety1, tech1, perc1, variety2, tech2, perc2,
-                     variety3, tech3, perc3, hectares):
-    if not variety1 or not tech1 or perc1 is None or hectares is None or hectares <= 0:
-        return "N/A", "N/A", "N/A", {}, {}, {}, ""
-
-    # Raccogli le informazioni delle varietà
-    varieties_info = []
-    percentages = []
-
-    # Prima varietà
-    variety_data = olive_varieties[
-        (olive_varieties['Varietà di Olive'] == variety1) &
-        (olive_varieties['Tecnica di Coltivazione'] == tech1)
-        ]
-    if not variety_data.empty:
-        varieties_info.append(variety_data.iloc[0])
-        percentages.append(perc1)
-
-    # Seconda varietà
-    if variety2 and tech2 and perc2:
-        variety_data = olive_varieties[
-            (olive_varieties['Varietà di Olive'] == variety2) &
-            (olive_varieties['Tecnica di Coltivazione'] == tech2)
-            ]
-        if not variety_data.empty:
-            varieties_info.append(variety_data.iloc[0])
-            percentages.append(perc2)
-
-    # Terza varietà
-    if variety3 and tech3 and perc3:
-        variety_data = olive_varieties[
-            (olive_varieties['Varietà di Olive'] == variety3) &
-            (olive_varieties['Tecnica di Coltivazione'] == tech3)
-            ]
-        if not variety_data.empty:
-            varieties_info.append(variety_data.iloc[0])
-            percentages.append(perc3)
-
-    try:
-        prediction = make_prediction(weather_data, varieties_info, percentages, hectares)
-
-        # Formattazione output principale
-        # Formattazione output con valori per ettaro e totali
-        olive_prod_text_ha = f"{prediction['olive_production']:.0f} kg/ha\n"
-        olive_prod_text = f"Totale: {prediction['olive_production_total']:.0f} kg"
-
-        oil_prod_text_ha = f"{prediction['avg_oil_production']:.0f} L/ha\n"
-        oil_prod_text = f"Totale: {(prediction['avg_oil_production_total'] * hectares):.0f} L"
-
-        water_need_text_ha = f"{prediction['water_need']:.0f} m³/ha\n"
-        water_need_text = f"Totale: {prediction['water_need_total']:.0f} m³"
-
-        # Creazione grafici con il nuovo stile
-        details_fig = create_production_details_figure(prediction)
-        weather_fig = create_weather_impact_figure(weather_data)
-        water_fig = create_water_needs_figure(prediction)
-
-        # Creazione info extra con il nuovo stile
-        extra_info = create_extra_info_component(prediction, varieties_info)
-
-        return (
-            olive_prod_text_ha, oil_prod_text_ha, water_need_text_ha,
-            olive_prod_text, oil_prod_text, water_need_text,
-            details_fig, weather_fig, water_fig, extra_info)
-
-    except Exception as e:
-        print(f"Errore nell'aggiornamento dashboard: {str(e)}")
-        return "Errore", "Errore", "Errore", {}, {}, {}, "Errore nella generazione dei dati"
-
-
 def create_production_details_figure(prediction):
     """Crea il grafico dei dettagli produzione con il nuovo stile"""
     details_data = prepare_details_data(prediction)
@@ -2075,6 +2399,7 @@ def create_weather_impact_figure(weather_data):
 
 def create_water_needs_figure(prediction):
     """Crea il grafico del fabbisogno idrico con il nuovo stile"""
+    # Definisci i mesi in italiano
     months = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
               'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
 
@@ -2088,21 +2413,41 @@ def create_water_needs_figure(prediction):
 
             water_need = variety_info[f'Fabbisogno Acqua {season} (m³/ettaro)']
             water_data.append({
-                'Mese': month,
-                'Varietà': detail['variety'],
-                'Fabbisogno': water_need * (detail['percentage'] / 100)
+                'Month': month,
+                'Variety': detail['variety'],
+                'Water_Need': water_need * (detail['percentage'] / 100)
             })
 
     water_df = pd.DataFrame(water_data)
     fig = px.bar(
         water_df,
-        x='Mese',
-        y='Fabbisogno',
-        color='Varietà',
+        x='Month',
+        y='Water_Need',
+        color='Variety',
         barmode='stack',
         color_discrete_sequence=['#2185d0', '#21ba45', '#6435c9']
     )
+
     return create_figure_layout(fig, 'Fabbisogno Idrico Mensile')
+
+
+def get_season_from_month(month):
+    """Helper function per determinare la stagione dal mese."""
+    seasons = {
+        'Gen': 'Inverno',
+        'Feb': 'Inverno',
+        'Mar': 'Primavera',
+        'Apr': 'Primavera',
+        'Mag': 'Primavera',
+        'Giu': 'Estate',
+        'Lug': 'Estate',
+        'Ago': 'Estate',
+        'Set': 'Autunno',
+        'Ott': 'Autunno',
+        'Nov': 'Autunno',
+        'Dic': 'Inverno'
+    }
+    return seasons[month]
 
 
 def prepare_details_data(prediction):
@@ -2153,15 +2498,31 @@ def get_season_from_month(month):
 
 
 @app.callback(
-    [Output('growth-simulation-chart', 'figure'),
-     Output('production-simulation-chart', 'figure'),
-     Output('simulation-summary', 'children'),
-     Output('kpi-container', 'children', allow_duplicate=True)],
-    [Input('simulate-btn', 'n_clicks')],
-    [State('temp-slider', 'value'),
-     State('humidity-slider', 'value'),
-     State('rainfall-input', 'value'),
-     State('radiation-input', 'value')],
+    [
+        Output('growth-simulation-chart', 'figure'),
+        Output('production-simulation-chart', 'figure'),
+        Output('simulation-summary', 'children'),
+        Output('kpi-container', 'children', allow_duplicate=True),
+        Output('olive-production_ha', 'children'),
+        Output('oil-production_ha', 'children'),
+        Output('water-need_ha', 'children'),
+        Output('olive-production', 'children'),
+        Output('oil-production', 'children'),
+        Output('water-need', 'children'),
+        Output('production-details', 'figure'),
+        Output('weather-impact', 'figure'),
+        Output('water-needs', 'figure'),
+        Output('extra-info', 'children')
+    ],
+    [
+        Input('simulate-btn', 'n_clicks')
+    ],
+    [
+        State('temp-slider', 'value'),
+        State('humidity-slider', 'value'),
+        State('rainfall-input', 'value'),
+        State('radiation-input', 'value')
+    ],
     prevent_initial_call='initial_duplicate'
 )
 def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
@@ -2174,7 +2535,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
         empty_production_fig = go.Figure()
         empty_summary = html.Div()
         empty_kpis = html.Div()
-        return empty_growth_fig, empty_production_fig, empty_summary, empty_kpis
+        return empty_growth_fig, empty_production_fig, empty_summary, empty_kpis, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, ""
 
     try:
         # Inizializza il simulatore
@@ -2215,7 +2576,55 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
             ]),
         ])
 
-        return growth_fig, production_fig, summary, kpi_indicators
+        try:
+            config = load_config()
+
+            hectares = config['oliveto']['hectares']
+            varieties_info = []
+            percentages = []
+
+            # Estrai le informazioni dalle varietà configurate
+            for variety_config in config['oliveto']['varieties']:
+                variety_data = olive_varieties[
+                    (olive_varieties['Varietà di Olive'] == variety_config['variety']) &
+                    (olive_varieties['Tecnica di Coltivazione'].str.lower() == variety_config['technique'].lower())
+                    ]
+                if not variety_data.empty:
+                    varieties_info.append(variety_data.iloc[0])
+                    percentages.append(variety_config['percentage'])
+
+            print(config['oliveto']['varieties'])
+            print(olive_varieties)
+
+            prediction = make_prediction(weather_data, varieties_info, percentages, hectares, sim_data)
+
+            # Formattazione output con valori per ettaro e totali
+            olive_prod_text_ha = f"{prediction['olive_production']:.0f} kg/ha\n"
+            olive_prod_text = f"Totale: {prediction['olive_production_total']:.0f} kg"
+
+            oil_prod_text_ha = f"{prediction['avg_oil_production']:.0f} L/ha\n"
+            oil_prod_text = f"Totale: {(prediction['avg_oil_production_total'] * hectares):.0f} L"
+
+            water_need_text_ha = f"{prediction['water_need']:.0f} m³/ha\n"
+            water_need_text = f"Totale: {prediction['water_need_total']:.0f} m³"
+
+            # Creazione grafici con il nuovo stile
+            details_fig = create_production_details_figure(prediction)
+            weather_fig = create_weather_impact_figure(weather_data)
+            water_fig = {}#create_water_needs_figure(prediction)
+
+            # Creazione info extra con il nuovo stile
+            extra_info = create_extra_info_component(prediction, varieties_info)
+
+            return (
+                growth_fig, production_fig, summary, kpi_indicators,
+                olive_prod_text_ha, oil_prod_text_ha, water_need_text_ha,
+                olive_prod_text, oil_prod_text, water_need_text,
+                details_fig, weather_fig, water_fig, extra_info)
+
+        except Exception as e:
+            print(f"Errore nell'aggiornamento dashboard: {str(e)}")
+            return growth_fig, production_fig, summary, kpi_indicators, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, ""
 
     except Exception as e:
         print(f"Errore nella simulazione: {str(e)}")
@@ -2227,7 +2636,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
             color="danger"
         )
         empty_kpis = html.Div()
-        return empty_growth_fig, empty_production_fig, error_summary, empty_kpis
+        return empty_growth_fig, empty_production_fig, error_summary, empty_kpis, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, ""
 
 
 # Aggiungiamo un callback per gestire l'abilitazione del pulsante di simulazione
@@ -2305,6 +2714,7 @@ def update_graph_style(graph_id):
         'min-height': '400px',
         'max-height': '800px'
     }
+
 
 if __name__ == '__main__':
     app.run_server(debug=True)

@@ -1,0 +1,21 @@
+# Data handling and analysis
+pandas>=1.5.0
+numpy>=1.21.0
+scikit-learn==1.5.2
+
+# Dashboard and visualization
+dash>=2.9.0
+dash-bootstrap-components>=1.4.0
+plotly>=5.13.0
+
+# Machine Learning
+tensorflow>=2.14.0
+keras>=2.14.0
+joblib>=1.2.0
+
+# Environment and configuration
+python-dotenv>=0.21.0
+psutil>=5.9.0
+
+# File handling
+dvc>=2.0.0  # Per la gestione dei file sources.dvc
