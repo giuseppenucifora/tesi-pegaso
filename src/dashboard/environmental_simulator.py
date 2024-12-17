@@ -48,6 +48,10 @@ class EnvironmentalSimulator:
         results = []
         current_date = datetime.now()
 
+        # Calcola valori giornalieri di pioggia e radiazione
+        daily_rainfall = rainfall / 30  # Distribuisce la pioggia mensile sui giorni
+        daily_radiation = radiation  # Usa il valore di radiazione fornito
+
         for day in range(days):
             # Calcola la fase corrente
             day_of_year = (current_date + timedelta(days=day)).timetuple().tm_yday
@@ -55,6 +59,12 @@ class EnvironmentalSimulator:
 
             # Simula temperatura giornaliera
             temp = np.random.uniform(temp_range[0], temp_range[1])
+
+            # Simula variazione giornaliera della pioggia (±20% del valore medio)
+            daily_rain = daily_rainfall * np.random.uniform(0.8, 1.2)
+
+            # Simula variazione giornaliera della radiazione (±10% del valore base)
+            daily_rad = daily_radiation * np.random.uniform(0.9, 1.1)
 
             # Calcola stress giornaliero
             stress = self.calculate_stress_index(temp_range, humidity, rainfall, radiation)
@@ -66,6 +76,9 @@ class EnvironmentalSimulator:
                 'date': current_date + timedelta(days=day),
                 'phase': phase,
                 'temperature': temp,
+                'rainfall': daily_rain,
+                'radiation': daily_rad,
+                'humidity': humidity,
                 'stress_index': stress,
                 'growth_rate': growth_rate
             })

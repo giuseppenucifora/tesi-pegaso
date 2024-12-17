@@ -9,11 +9,6 @@ import json
 from utils.helpers import clean_column_name
 from dashboard.environmental_simulator import *
 from dotenv import load_dotenv
-import sagemaker
-from sagemaker.tensorflow import TensorFlowModel
-from sagemaker.serverless import ServerlessInferenceConfig
-from sagemaker import Session
-import boto3
 
 CONFIG_FILE = 'olive_config.json'
 
@@ -22,6 +17,13 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # Set global precision policy
 tf.keras.mixed_precision.set_global_policy('float32')
+
+DEV_MODE = True
+model = None
+scaler_temporal = None
+scaler_static = None
+scaler_y = None
+MODEL_LOADING = False
 
 
 def load_config():
@@ -54,6 +56,10 @@ def load_config():
                 'etichettatura': 0.30
             },
             'selling_price': 12.00
+        },
+        'inference': {
+            'debug_mode': True,
+            'model_path': './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
         }
     }
 
@@ -82,150 +88,12 @@ try:
     simulated_data = pd.read_parquet("./sources/olive_training_dataset.parquet")
     weather_data = pd.read_parquet("./sources/weather_data_solarenergy.parquet")
     olive_varieties = pd.read_parquet("./sources/olive_varieties.parquet")
-    if not True:
+    scaler_temporal = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_temporal.joblib')
+    scaler_static = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_static.joblib')
+    scaler_y = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_y.joblib')
 
-        # Print versions and system information
-        print(f"Keras version: {keras.__version__}")
-        print(f"TensorFlow version: {tf.__version__}")
-        print(f"CUDA available: {tf.test.is_built_with_cuda()}")
-        print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
-
-        # GPU memory configuration
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        if gpus:
-            try:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-
-                logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-                print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-            except RuntimeError as e:
-                print(e)
-
-
-        @keras.saving.register_keras_serializable()
-        class DataAugmentation(tf.keras.layers.Layer):
-            """Custom layer per l'augmentation dei dati"""
-
-            def __init__(self, noise_stddev=0.03, **kwargs):
-                super().__init__(**kwargs)
-                self.noise_stddev = noise_stddev
-
-            def call(self, inputs, training=None):
-                if training:
-                    return inputs + tf.random.normal(
-                        shape=tf.shape(inputs),
-                        mean=0.0,
-                        stddev=self.noise_stddev
-                    )
-                return inputs
-
-            def get_config(self):
-                config = super().get_config()
-                config.update({"noise_stddev": self.noise_stddev})
-                return config
-
-
-        @keras.saving.register_keras_serializable()
-        class PositionalEncoding(tf.keras.layers.Layer):
-            """Custom layer per l'encoding posizionale"""
-
-            def __init__(self, d_model, **kwargs):
-                super().__init__(**kwargs)
-                self.d_model = d_model
-
-            def build(self, input_shape):
-                _, seq_length, _ = input_shape
-
-                # Crea la matrice di encoding posizionale
-                position = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
-                div_term = tf.exp(
-                    tf.range(0, self.d_model, 2, dtype=tf.float32) *
-                    (-tf.math.log(10000.0) / self.d_model)
-                )
-
-                # Calcola sin e cos
-                pos_encoding = tf.zeros((1, seq_length, self.d_model))
-                pos_encoding_even = tf.sin(position * div_term)
-                pos_encoding_odd = tf.cos(position * div_term)
-
-                # Assegna i valori alle posizioni pari e dispari
-                pos_encoding = tf.concat(
-                    [tf.expand_dims(pos_encoding_even, -1),
-                     tf.expand_dims(pos_encoding_odd, -1)],
-                    axis=-1
-                )
-                pos_encoding = tf.reshape(pos_encoding, (1, seq_length, -1))
-                pos_encoding = pos_encoding[:, :, :self.d_model]
-
-                # Salva l'encoding come peso non trainabile
-                self.pos_encoding = self.add_weight(
-                    shape=(1, seq_length, self.d_model),
-                    initializer=tf.keras.initializers.Constant(pos_encoding),
-                    trainable=False,
-                    name='positional_encoding'
-                )
-
-                super().build(input_shape)
-
-            def call(self, inputs):
-                # Broadcast l'encoding posizionale sul batch
-                batch_size = tf.shape(inputs)[0]
-                pos_encoding_tiled = tf.tile(self.pos_encoding, [batch_size, 1, 1])
-                return inputs + pos_encoding_tiled
-
-            def get_config(self):
-                config = super().get_config()
-                config.update({"d_model": self.d_model})
-                return config
-
-
-        @keras.saving.register_keras_serializable()
-        class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-            """Custom learning rate schedule with linear warmup and exponential decay."""
-
-            def __init__(self, initial_learning_rate=1e-3, warmup_steps=500, decay_steps=5000):
-                super().__init__()
-                self.initial_learning_rate = initial_learning_rate
-                self.warmup_steps = warmup_steps
-                self.decay_steps = decay_steps
-
-            def __call__(self, step):
-                warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
-                warmup_lr = self.initial_learning_rate * warmup_pct
-                decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
-                decayed_lr = self.initial_learning_rate * decay_factor
-                return tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
-
-            def get_config(self):
-                return {
-                    'initial_learning_rate': self.initial_learning_rate,
-                    'warmup_steps': self.warmup_steps,
-                    'decay_steps': self.decay_steps
-                }
-
-
-        @keras.saving.register_keras_serializable()
-        def weighted_huber_loss(y_true, y_pred):
-            # Pesi per diversi output
-            weights = tf.constant([1.0, 0.8, 0.8, 1.0, 0.6], dtype=tf.float32)
-            huber = tf.keras.losses.Huber(delta=1.0)
-            loss = huber(y_true, y_pred)
-            weighted_loss = tf.reduce_mean(loss * weights)
-            return weighted_loss
-
-
-        print("Caricamento modello e scaler...")
-        model = tf.keras.models.load_model('./sources/olive_oil_transformer/olive_oil_transformer_model.keras')
-
-        # model.save('./sources/olive_oil_transformer/olive_oil_transformer_model', save_format='tf')
-
-        scaler_temporal = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_temporal.joblib')
-        scaler_static = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_static.joblib')
-        scaler_y = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_y.joblib')
-    else:
-        print("Modalità sviluppo attiva - Modelli non caricati")
-
+    config = load_config()
+    DEV_MODE = config.get('inference', {}).get('debug_mode', True)
 except Exception as e:
     print(f"Errore nel caricamento: {str(e)}")
     raise e
@@ -460,7 +328,6 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares, si
 
 
 def make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data=None):
-    DEV_MODE = True
     if DEV_MODE:
         return mock_make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data)
     try:
@@ -563,12 +430,6 @@ def make_prediction(weather_data, varieties_info, percentages, hectares, simulat
 
         print(f"Shape dei dati temporali: {temporal_data.shape}")
         print(f"Shape dei dati statici: {static_data.shape}")
-
-        # Debug info
-        print("Static data:")
-        print(static_data)
-        print("\nTemporal data:")
-        print(temporal_data)
 
         # Standardizza i dati
         temporal_data = scaler_temporal.transform(temporal_data.reshape(1, -1)).reshape(1, 1, -1)
@@ -989,10 +850,9 @@ def create_configuration_tab():
                     ])
                 ], className="mb-4")
             ], md=6),
-            # Sezione SageMaker
             dbc.Row([
                 dbc.Col([
-                    create_sagemaker_config_section()
+                    create_inference_config_section()
                 ], md=12)
             ]),
             # Configurazione Costi
@@ -1013,57 +873,213 @@ def create_configuration_tab():
 
 
 @app.callback(
-    [Output('sagemaker-status', 'children'),
-     Output('sagemaker-endpoint', 'children'),
-     Output('sagemaker-latency', 'children'),
-     Output('sagemaker-requests', 'children')],
-    [Input('sagemaker-switch', 'value')],
-    [State('sagemaker-memory', 'value'),
-     State('sagemaker-concurrency', 'value'),
-     State('sagemaker-model-uri', 'value'),
-     State('sagemaker-role', 'value')]
+    [Output('inference-status', 'children'),
+     Output('inference-mode', 'children'),
+     Output('inference-latency', 'children'),
+     Output('inference-requests', 'children')],
+    [Input('debug-switch', 'value')]
 )
-def toggle_sagemaker(enabled, memory, concurrency, model_uri, role):
-    if not enabled:
-        return (
-            dbc.Alert("Servizio non attivo", color="warning"),
-            "N/A",
-            "N/A",
-            "N/A"
-        )
-    else:
+def toggle_inference_mode(debug_mode):
+    global DEV_MODE
+    global model
+    try:
+        config = load_config()
+
+        # Aggiorna la modalità debug nella configurazione
+        config['inference'] = config.get('inference', {})  # Crea la sezione se non esiste
+        config['inference']['debug_mode'] = debug_mode
+
+        # Salva la configurazione aggiornata
         try:
-            boto3.setup_default_session(profile_name="giuseppenucifora", region_name="eu-west-1")
-            session = Session()
-            # Inizializza SageMaker
-            tf_model = TensorFlowModel(
-                model_data=model_uri,
-                role=role,
-                framework_version="2.14"
-            )
-
-            serverless_config = ServerlessInferenceConfig(
-                memory_size_in_mb=memory,
-                max_concurrency=concurrency,
-            )
-
-            # Deploy del modello
-            predictor = tf_model.deploy(serverless_inference_config=serverless_config)
-
-            return (
-                dbc.Alert("Servizio attivo", color="success"),
-                predictor.endpoint_name,
-                "< 100ms",
-                "0"
-            )
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=4)
         except Exception as e:
-            print(f"Errore nell'attivazione di SageMaker: {str(e)}")
+            print(f"Errore nel salvataggio della configurazione: {e}")
+
+        DEV_MODE = debug_mode
+
+        if debug_mode:
             return (
-                dbc.Alert(f"Errore: {str(e)}", color="danger"),
-                "Errore",
-                "Errore",
-                "Errore"
+                dbc.Alert("Modalità Debug attiva - Using mock predictions", color="info"),
+                "Debug (Mock)",
+                "< 1ms",
+                "N/A"
             )
+        else:
+            try:
+                print(f"Keras version: {keras.__version__}")
+                print(f"TensorFlow version: {tf.__version__}")
+                print(f"CUDA available: {tf.test.is_built_with_cuda()}")
+                print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
+
+                # GPU memory configuration
+                gpus = tf.config.experimental.list_physical_devices('GPU')
+                if gpus:
+                    try:
+                        for gpu in gpus:
+                            tf.config.experimental.set_memory_growth(gpu, True)
+
+                        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+                        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+                    except RuntimeError as e:
+                        print(e)
+
+                @keras.saving.register_keras_serializable()
+                class DataAugmentation(tf.keras.layers.Layer):
+                    """Custom layer per l'augmentation dei dati"""
+
+                    def __init__(self, noise_stddev=0.03, **kwargs):
+                        super().__init__(**kwargs)
+                        self.noise_stddev = noise_stddev
+
+                    def call(self, inputs, training=None):
+                        if training:
+                            return inputs + tf.random.normal(
+                                shape=tf.shape(inputs),
+                                mean=0.0,
+                                stddev=self.noise_stddev
+                            )
+                        return inputs
+
+                    def get_config(self):
+                        config = super().get_config()
+                        config.update({"noise_stddev": self.noise_stddev})
+                        return config
+
+                @keras.saving.register_keras_serializable()
+                class PositionalEncoding(tf.keras.layers.Layer):
+                    """Custom layer per l'encoding posizionale"""
+
+                    def __init__(self, d_model, **kwargs):
+                        super().__init__(**kwargs)
+                        self.d_model = d_model
+
+                    def build(self, input_shape):
+                        _, seq_length, _ = input_shape
+
+                        # Crea la matrice di encoding posizionale
+                        position = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
+                        div_term = tf.exp(
+                            tf.range(0, self.d_model, 2, dtype=tf.float32) *
+                            (-tf.math.log(10000.0) / self.d_model)
+                        )
+
+                        # Calcola sin e cos
+                        pos_encoding = tf.zeros((1, seq_length, self.d_model))
+                        pos_encoding_even = tf.sin(position * div_term)
+                        pos_encoding_odd = tf.cos(position * div_term)
+
+                        # Assegna i valori alle posizioni pari e dispari
+                        pos_encoding = tf.concat(
+                            [tf.expand_dims(pos_encoding_even, -1),
+                             tf.expand_dims(pos_encoding_odd, -1)],
+                            axis=-1
+                        )
+                        pos_encoding = tf.reshape(pos_encoding, (1, seq_length, -1))
+                        pos_encoding = pos_encoding[:, :, :self.d_model]
+
+                        # Salva l'encoding come peso non trainabile
+                        self.pos_encoding = self.add_weight(
+                            shape=(1, seq_length, self.d_model),
+                            initializer=tf.keras.initializers.Constant(pos_encoding),
+                            trainable=False,
+                            name='positional_encoding'
+                        )
+
+                        super().build(input_shape)
+
+                    def call(self, inputs):
+                        # Broadcast l'encoding posizionale sul batch
+                        batch_size = tf.shape(inputs)[0]
+                        pos_encoding_tiled = tf.tile(self.pos_encoding, [batch_size, 1, 1])
+                        return inputs + pos_encoding_tiled
+
+                    def get_config(self):
+                        config = super().get_config()
+                        config.update({"d_model": self.d_model})
+                        return config
+
+                @keras.saving.register_keras_serializable()
+                class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+                    """Custom learning rate schedule with linear warmup and exponential decay."""
+
+                    def __init__(self, initial_learning_rate=1e-3, warmup_steps=500, decay_steps=5000):
+                        super().__init__()
+                        self.initial_learning_rate = initial_learning_rate
+                        self.warmup_steps = warmup_steps
+                        self.decay_steps = decay_steps
+
+                    def __call__(self, step):
+                        warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
+                        warmup_lr = self.initial_learning_rate * warmup_pct
+                        decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
+                        decayed_lr = self.initial_learning_rate * decay_factor
+                        return tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
+
+                    def get_config(self):
+                        return {
+                            'initial_learning_rate': self.initial_learning_rate,
+                            'warmup_steps': self.warmup_steps,
+                            'decay_steps': self.decay_steps
+                        }
+
+                @keras.saving.register_keras_serializable()
+                def weighted_huber_loss(y_true, y_pred):
+                    # Pesi per diversi output
+                    weights = tf.constant([1.0, 0.8, 0.8, 1.0, 0.6], dtype=tf.float32)
+                    huber = tf.keras.losses.Huber(delta=1.0)
+                    loss = huber(y_true, y_pred)
+                    weighted_loss = tf.reduce_mean(loss * weights)
+                    return weighted_loss
+
+                print("Caricamento modello e scaler...")
+
+                # Verifica che il modello sia disponibile
+                model_path = './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(f"Modello non trovato in: {model_path}")
+
+                # Prova a caricare il modello
+                model = tf.keras.models.load_model(model_path, custom_objects={
+                    'DataAugmentation': DataAugmentation,
+                    'PositionalEncoding': PositionalEncoding,
+                    'WarmUpLearningRateSchedule': WarmUpLearningRateSchedule,
+                    'weighted_huber_loss': weighted_huber_loss
+                })
+
+                return (
+                    dbc.Alert("Modello caricato correttamente", color="success"),
+                    "Produzione (Local Model)",
+                    "~ 100ms",
+                    "0"
+                )
+            except Exception as e:
+                print(f"Errore nel caricamento del modello: {str(e)}")
+                # Se c'è un errore nel caricamento del modello, torna in modalità debug
+                DEV_MODE = True
+
+                # Aggiorna la configurazione per riflettere il fallback
+                config['inference']['debug_mode'] = True
+                try:
+                    with open(CONFIG_FILE, 'w') as f:
+                        json.dump(config, f, indent=4)
+                except Exception as save_error:
+                    print(f"Errore nel salvataggio della configurazione di fallback: {save_error}")
+
+                return (
+                    dbc.Alert(f"Errore nel caricamento del modello: {str(e)}", color="danger"),
+                    "Debug (Mock) - Fallback",
+                    "N/A",
+                    "N/A"
+                )
+    except Exception as e:
+        print(f"Errore nella configurazione inferenza: {str(e)}")
+        return (
+            dbc.Alert(f"Errore: {str(e)}", color="danger"),
+            "Errore",
+            "Errore",
+            "Errore"
+        )
 
 
 def create_economic_analysis_tab():
@@ -1829,14 +1845,18 @@ def create_costs_config_section():
     ])
 
 
-def create_sagemaker_config_section():
+def create_inference_config_section():
+
+    config = load_config()
+    debug_mode = config.get('inference', {}).get('debug_mode', True)
+
     return dbc.Card([
         dbc.CardHeader([
-            html.H4("Configurazione SageMaker", className="text-primary mb-0"),
+            html.H4("Configurazione Inferenza", className="text-primary mb-0"),
             dbc.Switch(
-                id='sagemaker-switch',
-                label="Abilita SageMaker",
-                value=False,
+                id='debug-switch',
+                label="Modalità Debug",
+                value=debug_mode,
                 className="mt-2"
             ),
         ], className="bg-light"),
@@ -1846,7 +1866,7 @@ def create_sagemaker_config_section():
                 dbc.Col([
                     html.Div([
                         html.H5("Stato Servizio", className="mb-3"),
-                        html.Div(id='sagemaker-status', className="mb-3"),
+                        html.Div(id='inference-status', className="mb-3"),
                     ])
                 ])
             ], className="mb-4"),
@@ -1858,59 +1878,15 @@ def create_sagemaker_config_section():
                     dbc.Form([
                         dbc.Row([
                             dbc.Col([
-                                dbc.Label("Memoria (MB):", className="fw-bold"),
-                                dbc.Input(
-                                    id='sagemaker-memory',
-                                    type='number',
-                                    min=512,
-                                    max=6144,
-                                    step=512,
-                                    value=2048,
-                                    className="mb-2"
-                                )
-                            ], md=6),
-                            dbc.Col([
-                                dbc.Label("Concorrenza massima:", className="fw-bold"),
-                                dbc.Input(
-                                    id='sagemaker-concurrency',
-                                    type='number',
-                                    min=1,
-                                    max=10,
-                                    value=5,
-                                    className="mb-2"
-                                )
-                            ], md=6),
-                        ]),
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Label("Model URI:", className="fw-bold"),
-                                dbc.Input(
-                                    id='sagemaker-model-uri',
-                                    type='text',
-                                    value="s3://sagemaker-oil-transformer/model/saved_model.pb",
-                                    className="mb-2",
-                                    disabled=True,
+                                dbc.Label("Modello:", className="fw-bold"),
+                                # Usa html.Div invece di dbc.Input per il percorso in sola lettura
+                                html.Div(
+                                    "./sources/olive_oil_transformer/olive_oil_transformer_model.keras",
+                                    id='model-path',
+                                    className="mb-2 p-2 bg-light border rounded",
                                     style={
-                                        "background-color": "#f8f9fa",
-                                        "opacity": "1",
-                                        "cursor": "not-allowed"
-                                    }
-                                )
-                            ], md=12),
-                        ]),
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Label("IAM Role:", className="fw-bold"),
-                                dbc.Input(
-                                    id='sagemaker-role',
-                                    type='text',
-                                    value="arn:aws:iam::906312666576:role/sagemaker-olive-oil",
-                                    className="mb-2",
-                                    disabled=True,
-                                    style={
-                                        "background-color": "#f8f9fa",
-                                        "opacity": "1",
-                                        "cursor": "not-allowed"
+                                        "font-family": "monospace",
+                                        "font-size": "0.9rem"
                                     }
                                 )
                             ], md=12),
@@ -1925,16 +1901,16 @@ def create_sagemaker_config_section():
                     html.H5("Metriche", className="mb-3"),
                     dbc.ListGroup([
                         dbc.ListGroupItem([
-                            html.Strong("Endpoint: "),
-                            html.Span(id='sagemaker-endpoint')
+                            html.Strong("Modalità: "),
+                            html.Span(id='inference-mode')
                         ]),
                         dbc.ListGroupItem([
                             html.Strong("Latenza media: "),
-                            html.Span(id='sagemaker-latency')
+                            html.Span(id='inference-latency')
                         ]),
                         dbc.ListGroupItem([
                             html.Strong("Richieste totali: "),
-                            html.Span(id='sagemaker-requests')
+                            html.Span(id='inference-requests')
                         ])
                     ], flush=True)
                 ])
@@ -2593,8 +2569,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
                     varieties_info.append(variety_data.iloc[0])
                     percentages.append(variety_config['percentage'])
 
-            print(config['oliveto']['varieties'])
-            print(olive_varieties)
+            print(sim_data)
 
             prediction = make_prediction(weather_data, varieties_info, percentages, hectares, sim_data)
 
