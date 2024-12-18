@@ -5,10 +5,12 @@ import keras
 import joblib
 import dash_bootstrap_components as dbc
 import os
+import argparse
 import json
 from utils.helpers import clean_column_name
 from dashboard.environmental_simulator import *
 from dotenv import load_dotenv
+from dash import no_update
 
 CONFIG_FILE = 'olive_config.json'
 
@@ -331,6 +333,21 @@ def make_prediction(weather_data, varieties_info, percentages, hectares, simulat
     if DEV_MODE:
         return mock_make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data)
     try:
+        if MODEL_LOADING:
+            return {
+                'olive_production': 0,  # kg/ha
+                'olive_production_total': 0 * hectares,  # kg totali
+                'min_oil_production': 0,  # L/ha
+                'max_oil_production': 0,  # L/ha
+                'avg_oil_production': 0,  # L/ha
+                'avg_oil_production_total': 0 * hectares,  # L totali
+                'water_need': 0,  # m³/ha
+                'water_need_total': 0,  # m³ totali
+                'variety_details': 0,
+                'hectares': hectares,
+                'stress_factor': 0 if simulation_data is not None else 1.0
+            }
+
         print("Inizio della funzione make_prediction")
 
         # Prepara i dati temporali (meteorologici)
@@ -443,37 +460,65 @@ def make_prediction(weather_data, varieties_info, percentages, hectares, simulat
 
         # Effettua la predizione
         prediction = model.predict(input_data)
+
+        print("\nRaw prediction:", prediction)
+
+        target_features = [
+            'olive_prod',        # Produzione olive kg/ha
+            'min_oil_prod',      # Produzione minima olio L/ha
+            'max_oil_prod',      # Produzione massima olio L/ha
+            'avg_oil_prod',      # Produzione media olio L/ha
+            'total_water_need'   # Fabbisogno idrico totale m³/ha
+        ]
+
         prediction = scaler_y.inverse_transform(prediction)[0]
+        print("\nInverse transformed prediction:")
+        for feature, value in zip(target_features, prediction):
+            print(f"{feature}: {value:.2f}")
 
         # Applica il fattore di stress se disponibile
         if simulation_data is not None:
             prediction = prediction * stress_factor
+            print(f"Applied stress factor: {stress_factor}")
+            print(f"Prediction after stress:", prediction)
+
+        # Calcola i valori per ettaro dividendo per il numero di ettari
+        olive_prod_ha = prediction[0] / hectares
+        min_oil_prod_ha = prediction[1] / hectares
+        max_oil_prod_ha = prediction[2] / hectares
+        avg_oil_prod_ha = prediction[3] / hectares
+        water_need_ha = prediction[4] / hectares
+
+        print("\nValori per ettaro:")
+        print(f"Olive production per ha: {olive_prod_ha:.2f} kg/ha")
+        print(f"Min oil production per ha: {min_oil_prod_ha:.2f} L/ha")
+        print(f"Max oil production per ha: {max_oil_prod_ha:.2f} L/ha")
+        print(f"Avg oil production per ha: {avg_oil_prod_ha:.2f} L/ha")
+        print(f"Water need per ha: {water_need_ha:.2f} m³/ha")
 
         # Calcola i dettagli per varietà
         variety_details = []
-        total_water_need = 0
+        total_water_need = prediction[4]  # Usa il valore predetto totale
 
         for variety_info, percentage in zip(varieties_info, percentages):
             # Calcoli specifici per varietà
-            prod_per_ha = float(variety_info['Produzione (tonnellate/ettaro)']) * 1000 * (percentage / 100)
+            base_prod_per_ha = float(variety_info['Produzione (tonnellate/ettaro)']) * 1000 * (percentage / 100)
+            prod_per_ha = base_prod_per_ha
             if simulation_data is not None:
                 prod_per_ha *= stress_factor
             prod_total = prod_per_ha * hectares
 
-            oil_per_ha = float(variety_info['Produzione Olio (litri/ettaro)']) * (percentage / 100)
+            base_oil_per_ha = float(variety_info['Produzione Olio (litri/ettaro)']) * (percentage / 100)
+            oil_per_ha = base_oil_per_ha
             if simulation_data is not None:
                 oil_per_ha *= stress_factor
             oil_total = oil_per_ha * hectares
 
-            # Calcolo fabbisogno idrico medio
-            water_need = (
-                                 float(variety_info['Fabbisogno Acqua Primavera (m³/ettaro)']) +
-                                 float(variety_info['Fabbisogno Acqua Estate (m³/ettaro)']) +
-                                 float(variety_info['Fabbisogno Acqua Autunno (m³/ettaro)']) +
-                                 float(variety_info['Fabbisogno Acqua Inverno (m³/ettaro)'])
-                         ) / 4 * (percentage / 100)
-
-            total_water_need += water_need * hectares
+            print(f"\nVariety: {variety_info['Varietà di Olive']}")
+            print(f"Base production: {base_prod_per_ha:.2f} kg/ha")
+            print(f"Final production: {prod_per_ha:.2f} kg/ha")
+            print(f"Base oil: {base_oil_per_ha:.2f} L/ha")
+            print(f"Final oil: {oil_per_ha:.2f} L/ha")
 
             variety_details.append({
                 'variety': variety_info['Varietà di Olive'],
@@ -482,19 +527,21 @@ def make_prediction(weather_data, varieties_info, percentages, hectares, simulat
                 'production_total': prod_total,
                 'oil_per_ha': oil_per_ha,
                 'oil_total': oil_total,
-                'water_need': water_need,
+                'water_need': water_need_ha * (percentage / 100),  # Distribuisci il fabbisogno idrico in base alla percentuale
+                'base_production': base_prod_per_ha,  # Produzione senza stress
+                'base_oil': base_oil_per_ha,         # Produzione olio senza stress
                 'stress_factor': stress_factor if simulation_data is not None else 1.0
             })
 
         return {
-            'olive_production': prediction[0],  # kg/ha
-            'olive_production_total': prediction[0] * hectares,  # kg totali
-            'min_oil_production': prediction[1],  # L/ha
-            'max_oil_production': prediction[2],  # L/ha
-            'avg_oil_production': prediction[3],  # L/ha
-            'avg_oil_production_total': prediction[3] * hectares,  # L totali
-            'water_need': prediction[4],  # m³/ha
-            'water_need_total': total_water_need,  # m³ totali
+            'olive_production': olive_prod_ha,          # kg/ha
+            'olive_production_total': prediction[0],    # kg totali
+            'min_oil_production': min_oil_prod_ha,      # L/ha
+            'max_oil_production': max_oil_prod_ha,      # L/ha
+            'avg_oil_production': avg_oil_prod_ha,      # L/ha
+            'avg_oil_production_total': prediction[3],  # L totali
+            'water_need': water_need_ha,               # m³/ha
+            'water_need_total': prediction[4],         # m³ totali
             'variety_details': variety_details,
             'hectares': hectares,
             'stress_factor': stress_factor if simulation_data is not None else 1.0
@@ -873,6 +920,24 @@ def create_configuration_tab():
 
 
 @app.callback(
+    Output('loading-alert', 'children'),
+    [Input('simulate-btn', 'n_clicks'),
+     Input('debug-switch', 'value')]
+)
+def update_loading_status(n_clicks, debug_mode):
+    if MODEL_LOADING:
+        return dbc.Alert(
+            [
+                html.I(className="fas fa-spinner fa-spin me-2"),
+                "Caricamento del modello in corso..."
+            ],
+            color="warning",
+            is_open=True
+        )
+    return None
+
+
+@app.callback(
     [Output('inference-status', 'children'),
      Output('inference-mode', 'children'),
      Output('inference-latency', 'children'),
@@ -880,8 +945,7 @@ def create_configuration_tab():
     [Input('debug-switch', 'value')]
 )
 def toggle_inference_mode(debug_mode):
-    global DEV_MODE
-    global model
+    global DEV_MODE, model, MODEL_LOADING, scaler_temporal, scaler_static, scaler_y
     try:
         config = load_config()
 
@@ -899,6 +963,8 @@ def toggle_inference_mode(debug_mode):
         DEV_MODE = debug_mode
 
         if debug_mode:
+            MODEL_LOADING = False
+            model = None
             return (
                 dbc.Alert("Modalità Debug attiva - Using mock predictions", color="info"),
                 "Debug (Mock)",
@@ -907,6 +973,7 @@ def toggle_inference_mode(debug_mode):
             )
         else:
             try:
+                MODEL_LOADING = True
                 print(f"Keras version: {keras.__version__}")
                 print(f"TensorFlow version: {tf.__version__}")
                 print(f"CUDA available: {tf.test.is_built_with_cuda()}")
@@ -1046,7 +1113,7 @@ def toggle_inference_mode(debug_mode):
                     'WarmUpLearningRateSchedule': WarmUpLearningRateSchedule,
                     'weighted_huber_loss': weighted_huber_loss
                 })
-
+                MODEL_LOADING = False
                 return (
                     dbc.Alert("Modello caricato correttamente", color="success"),
                     "Produzione (Local Model)",
@@ -1057,15 +1124,7 @@ def toggle_inference_mode(debug_mode):
                 print(f"Errore nel caricamento del modello: {str(e)}")
                 # Se c'è un errore nel caricamento del modello, torna in modalità debug
                 DEV_MODE = True
-
-                # Aggiorna la configurazione per riflettere il fallback
-                config['inference']['debug_mode'] = True
-                try:
-                    with open(CONFIG_FILE, 'w') as f:
-                        json.dump(config, f, indent=4)
-                except Exception as save_error:
-                    print(f"Errore nel salvataggio della configurazione di fallback: {save_error}")
-
+                MODEL_LOADING = False
                 return (
                     dbc.Alert(f"Errore nel caricamento del modello: {str(e)}", color="danger"),
                     "Debug (Mock) - Fallback",
@@ -1074,6 +1133,7 @@ def toggle_inference_mode(debug_mode):
                 )
     except Exception as e:
         print(f"Errore nella configurazione inferenza: {str(e)}")
+        MODEL_LOADING = False
         return (
             dbc.Alert(f"Errore: {str(e)}", color="danger"),
             "Errore",
@@ -1846,7 +1906,6 @@ def create_costs_config_section():
 
 
 def create_inference_config_section():
-
     config = load_config()
     debug_mode = config.get('inference', {}).get('debug_mode', True)
 
@@ -1921,6 +1980,7 @@ def create_inference_config_section():
 
 app.layout = dbc.Container([
     dcc.Location(id='_pages_location'),
+    html.Div(id='loading-alert'),
     variety2_tooltip,
     variety3_tooltip,
     # Header
@@ -2217,12 +2277,36 @@ def create_figure_layout(fig, title):
     return fig
 
 
-from dash import no_update
 
 
 @app.callback(
+    Output("percentage-warning", "children"),
     [
-        # Outputs per i costi e configurazioni base (16 outputs)
+        Input("percentage-1-input", "value"),
+        Input("percentage-2-input", "value"),
+        Input("percentage-3-input", "value")
+    ]
+)
+def check_percentages(perc1, perc2, perc3):
+    try:
+        # Calcola la somma delle percentuali, considerando solo i valori non nulli
+        total = sum(p for p in [perc1 or 0, perc2 or 0, perc3 or 0])
+
+        if total > 100:
+            return dbc.Alert(
+                f"La somma delle percentuali è {total}% (non può superare 100%)",
+                color="danger",
+                className="mt-2"
+            )
+        return ""
+
+    except Exception as e:
+        print(f"Errore nel controllo delle percentuali: {str(e)}")
+        return ""
+
+@app.callback(
+    [
+        # Outputs per i costi e configurazioni base (15 outputs, escluso warning)
         Output("hectares-input", "value"),
         Output("variety-1-dropdown", "value"),
         Output("technique-1-dropdown", "value"),
@@ -2238,7 +2322,6 @@ from dash import no_update
         Output("technique-3-dropdown", "disabled"),
         Output("percentage-3-input", "value"),
         Output("percentage-3-input", "disabled"),
-        Output("percentage-warning", "children"),
         # Outputs per i costi fissi (4 outputs)
         Output("cost-ammortamento", "value"),
         Output("cost-assicurazione", "value"),
@@ -2264,18 +2347,12 @@ from dash import no_update
         Input("tabs", "active_tab"),
         Input("variety-2-dropdown", "value"),
         Input("variety-3-dropdown", "value"),
-        Input("percentage-1-input", "value"),
-        Input("percentage-2-input", "value"),
-        Input("percentage-3-input", "value"),
-        Input('_pages_location', 'pathname')  # Aggiunto per trigger all'avvio
+        Input('_pages_location', 'pathname')
     ]
 )
-def unified_config_manager(active_tab, variety2, variety3, perc1, perc2, perc3, pathname):
-    ctx = callback_context
-    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
-
+def load_configuration(active_tab, variety2, variety3, pathname):
     try:
-        # Carica sempre la configurazione
+        # Carica la configurazione
         config = load_config()
 
         # Carica dati varietà
@@ -2294,14 +2371,8 @@ def unified_config_manager(active_tab, variety2, variety3, perc1, perc2, perc3, 
         var2_exists = var2["variety"] is not None
         var3_exists = var3["variety"] is not None
 
-        # Calcolo warning percentuali
-        total = sum(v["percentage"] for v in varieties if v["variety"] is not None)
-        warning = ""
-        if total != 100:
-            warning = f"La somma delle percentuali è {total}% (dovrebbe essere 100%)"
-
         return [
-            # Configurazioni base (16 valori)
+            # Configurazioni base (15 valori)
             config['oliveto']['hectares'],
             var1["variety"],
             var1["technique"],
@@ -2317,7 +2388,6 @@ def unified_config_manager(active_tab, variety2, variety3, perc1, perc2, perc3, 
             not var2_exists or not var3_exists,
             var3["percentage"],
             not var2_exists or not var3_exists,
-            warning,
             # Costi fissi (4 valori)
             fixed.get('ammortamento', 10000),
             fixed.get('assicurazione', 2500),
@@ -2341,9 +2411,8 @@ def unified_config_manager(active_tab, variety2, variety3, perc1, perc2, perc3, 
         ]
 
     except Exception as e:
-        print(f"Errore in unified_config_manager: {str(e)}")
-        # In caso di errore, ritorna no_update per tutti i valori
-        return [no_update] * 32
+        print(f"Errore in load_configuration: {str(e)}")
+        return [no_update] * 31
 
 
 def create_production_details_figure(prediction):
@@ -2505,7 +2574,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
     """
     Callback principale per aggiornare tutti i componenti della simulazione
     """
-    if n_clicks is None:
+    if n_clicks is None or MODEL_LOADING:
         # Crea grafici vuoti per l'inizializzazione
         empty_growth_fig = go.Figure()
         empty_production_fig = go.Figure()
@@ -2569,8 +2638,6 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
                     varieties_info.append(variety_data.iloc[0])
                     percentages.append(variety_config['percentage'])
 
-            print(sim_data)
-
             prediction = make_prediction(weather_data, varieties_info, percentages, hectares, sim_data)
 
             # Formattazione output con valori per ettaro e totali
@@ -2586,7 +2653,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
             # Creazione grafici con il nuovo stile
             details_fig = create_production_details_figure(prediction)
             weather_fig = create_weather_impact_figure(weather_data)
-            water_fig = {}#create_water_needs_figure(prediction)
+            water_fig = {}  # create_water_needs_figure(prediction)
 
             # Creazione info extra con il nuovo stile
             extra_info = create_extra_info_component(prediction, varieties_info)
@@ -2692,4 +2759,16 @@ def update_graph_style(graph_id):
 
 
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    port = int(os.environ.get('DASH_PORT', 8050))
+    debug = int(os.environ.get('DASH_DEBUG', True))
+
+    # Oppure usando argparse per gli argomenti da riga di comando
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=8050, help='Port to run the server on')
+    args = parser.parse_args()
+
+    app.run_server(
+        host='0.0.0.0',
+        port=args.port,
+        debug=debug
+    )

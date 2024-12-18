@@ -1,20 +1,20 @@
 {
     "oliveto": {
-        "hectares": 10,
+        "hectares": 4.35,
         "varieties": [
             {
                 "variety": "Nocellara dell'Etna",
-                "technique": "intensiva",
-                "percentage": 30
+                "technique": "tradizionale",
+                "percentage": 50
             },
             {
                 "variety": "Frantoio",
                 "technique": "tradizionale",
-                "percentage": 30
+                "percentage": 10
             },
             {
                 "variety": "Coratina",
-                "technique": "superintensiva",
+                "technique": "tradizionale",
                 "percentage": 40
             }
         ]
@@ -44,5 +44,8 @@
             "prezzo_vendita": 12,
             "perc_vendita_diretta": 30
         }
+    },
+    "inference": {
+        "debug_mode": false
     }
 }
