@@ -2759,12 +2759,13 @@ def update_graph_style(graph_id):
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('DASH_PORT', 8050))
-    debug = int(os.environ.get('DASH_DEBUG', True))
+    port = int(os.environ.get('DASH_PORT', 8888))
+    debug = int(os.environ.get('DASH_DEBUG', False))
 
     # Oppure usando argparse per gli argomenti da riga di comando
     parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=8050, help='Port to run the server on')
+    parser.add_argument('--port', type=int, default=8888, help='Port to run the server on')
+    parser.add_argument('--debug', type=bool, default=False, help='Debug')
     args = parser.parse_args()
 
     app.run_server(

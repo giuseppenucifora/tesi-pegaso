@@ -34,13 +34,6 @@ Questa dashboard interattiva permette di simulare e analizzare la produzione di 
    ```bash
    pip install -r src/requirements.txt
    ```
-
-## Configurazione del Progetto
-
-1. Crea un file `.env` nella directory `src` con le seguenti variabili:
-   ```env
-   DEV_MODE=True  # Imposta su False per utilizzare i modelli ML
-   ```
    
 ## Esecuzione della Dashboard
 
@@ -51,12 +44,22 @@ Questa dashboard interattiva permette di simulare e analizzare la produzione di 
 
 2. Avvia la dashboard:
    ```bash
-   python olive-oil-dashboard.py
+   python olive-oil-dashboard.py [options]
+   ```
+
+#### Opzioni disponibili:
+
+- port PORT: Specifica la porta su cui avviare il server (default: 8888)
+- debug : Attiva la modalità debug con auto-reload (default: False)
+
+#### Esempio:
+   ```bash
+   python olive-oil-dashboard.py --port 8888 --debug
    ```
 
 3. Apri un browser e vai all'indirizzo:
    ```
-   http://localhost:8050
+   http://localhost:8888
    ```
 
 ## Struttura del Progetto
