@@ -2143,9 +2143,8 @@ def update_loading_status(n_clicks, debug_mode):
 
     config = load_config()
 
-    print(config)
     DEV_MODE = config['inference']['debug_mode']
-    if MODEL_LOADING:
+    if not DEV_MODE and MODEL_LOADING:
         return dbc.Alert(
             [
                 html.I(className="fas fa-spinner fa-spin me-2"),
@@ -2824,7 +2823,7 @@ def check_percentages(perc1, perc2, perc3):
          lambda x: x == '/')
     ]
 )
-def load_configuration(active_tab, variety2, variety3, pathname):
+def load_configuration(active_tab, var2_current, var3_current, pathname):
     try:
         # Carica la configurazione
         config = load_config()
@@ -2835,6 +2834,20 @@ def load_configuration(active_tab, variety2, variety3, pathname):
         var2 = varieties[1] if len(varieties) > 1 else {"variety": None, "technique": None, "percentage": 0}
         var3 = varieties[2] if len(varieties) > 2 else {"variety": None, "technique": None, "percentage": 0}
 
+        print(var2_current)
+        if var2_current is not None:
+            var2 = next((v for v in varieties if v["variety"] == var2_current),
+                        {"variety": var2_current, "technique": None, "percentage": 0})
+        else:
+            var2 = {"variety": None, "technique": None, "percentage": 0}
+
+        if var3_current is not None:
+            var3 = next((v for v in varieties if v["variety"] == var3_current),
+                        {"variety": var3_current, "technique": None, "percentage": 0})
+        else:
+            var3 = {"variety": None, "technique": None, "percentage": 0}
+
+
         # Carica costi e marketing
         costs = config['costs']
         fixed = costs.get('fixed', {})
@@ -2842,8 +2855,8 @@ def load_configuration(active_tab, variety2, variety3, pathname):
         transformation = costs.get('transformation', {})
         marketing = costs.get('marketing', {})
 
-        var2_exists = var2["variety"] is not None
-        var3_exists = var3["variety"] is not None
+        var2_exists = True
+        var3_exists = True
 
         return [
             # Configurazioni base (15 valori)
