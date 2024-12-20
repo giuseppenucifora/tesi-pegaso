@@ -424,10 +424,20 @@ def calculate_weather_effect(row, optimal_temp):
     return combined_effect
 
 def calculate_water_need(weather_data, base_need, optimal_temp):
-    # Calcola il fabbisogno idrico basato su temperatura e precipitazioni
-    temp_factor = 1 + 0.05 * (weather_data['temp_mean'] - optimal_temp)  # Aumenta del 5% per ogni grado sopra l'ottimale
-    rain_factor = 1 - 0.001 * weather_data['precip_sum']  # Diminuisce leggermente con l'aumentare delle precipitazioni
-    return base_need * temp_factor * rain_factor
+    # Calcola il fattore temperatura (minimo 80% del fabbisogno)
+    temp_factor = max(0.8, 1 + 0.05 * (weather_data['temp_mean'] - optimal_temp))
+
+    # Calcola il fattore precipitazioni (minimo 50% del fabbisogno)
+    rain_factor = max(0.5, 1 - 0.001 * weather_data['precip_sum'])
+
+    # Calcola il fabbisogno idrico totale
+    water_need = base_need * temp_factor * rain_factor
+
+    # Debug: controlla che il fabbisogno idrico sia positivo
+    assert water_need >= 0, "Il fabbisogno idrico calcolato è negativo!"
+
+    return water_need
+
 
 def create_technique_mapping(olive_varieties, mapping_path='./sources/technique_mapping.joblib'):
     # Estrai tutte le tecniche uniche dal dataset e convertile in lowercase

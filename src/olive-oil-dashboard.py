@@ -1,3 +1,4 @@
+import flask
 import plotly.express as px
 from dash import Dash, dcc, html, Input, Output, State, callback_context
 import tensorflow as tf
@@ -7,12 +8,18 @@ import dash_bootstrap_components as dbc
 import os
 import argparse
 import json
+from dash.exceptions import PreventUpdate
+
+from auth import utils
 from utils.helpers import clean_column_name
 from dashboard.environmental_simulator import *
-from dotenv import load_dotenv
 from dash import no_update
-
-CONFIG_FILE = 'olive_config.json'
+from auth.utils import (
+    init_directory_structure, verify_user, create_token,
+    verify_token, create_user, get_user_config_path, get_default_config
+)
+from auth.login import create_login_layout, create_register_layout
+from components.ids import Ids
 
 # Reduce TensorFlow logging verbosity
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -29,79 +36,90 @@ MODEL_LOADING = False
 
 
 def load_config():
-    default_config = {
-        'oliveto': {
-            'hectares': 1,
-            'varieties': [
-                {
-                    'variety': olive_varieties['Varietà di Olive'].iloc[0],
-                    'technique': 'Tradizionale',
-                    'percentage': 100
-                }
-            ]
-        },
-        'costs': {
-            'fixed': {
-                'ammortamento': 2000,
-                'assicurazione': 500,
-                'manutenzione': 800
-            },
-            'variable': {
-                'raccolta': 0.35,
-                'potatura': 600,
-                'fertilizzanti': 400
-            },
-            'transformation': {
-                'molitura': 0.15,
-                'stoccaggio': 0.20,
-                'bottiglia': 1.20,
-                'etichettatura': 0.30
-            },
-            'selling_price': 12.00
-        },
-        'inference': {
-            'debug_mode': True,
-            'model_path': './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
-        }
-    }
-
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        return default_config
+        config = None
+        # Prova a leggere la sessione corrente
+        session_data = check_session()
+        if session_data:
+            username = session_data.get('username')
+            if username:
+                config_path = get_user_config_path(username)
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                    print(f'Loaded configuration for user: {username}')
+
+        # Se non c'è config utente, usa quella di default
+        if config is None:
+            config = get_default_config()
+            print('Using default configuration')
+
+        return config
     except Exception as e:
         print(f"Errore nel caricamento della configurazione: {e}")
-        return default_config
+        return get_default_config()
 
 
-# Funzione per salvare la configurazione
 def save_config(config):
+    """
+    Salva la configurazione nel file di configurazione
+    Returns: (success: bool, message: str)
+    """
     try:
-        with open(CONFIG_FILE, 'w') as f:
+        config_path = None
+
+        # Determina il percorso del file di configurazione
+        if flask.has_request_context():
+            try:
+                session_data = check_session()
+                if session_data and 'username' in session_data:
+                    username = session_data['username']
+                    config_path = get_user_config_path(username)
+                    print(f'Using configuration path for user {username}: {config_path}')
+            except Exception as e:
+                print(f"Error accessing session: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Se non abbiamo un percorso utente specifico
+        if config_path is None:
+            print("WARNING: No user found in session!")
+            return False, "Nessun utente trovato nella sessione. Effettua nuovamente il login."
+
+        # Assicurati che la directory esista
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+        # Verifica che la configurazione sia valida
+        if not isinstance(config, dict):
+            return False, "Configurazione non valida"
+
+        # Salva la configurazione
+        with open(config_path, 'w') as f:
             json.dump(config, f, indent=4)
-        return True
+
+        return True, f"Configurazione salvata con successo in {config_path}"
+
     except Exception as e:
-        print(f"Errore nel salvataggio della configurazione: {e}")
-        return False
+        print(f"Errore nel salvataggio della configurazione: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False, f"Errore nel salvataggio: {str(e)}"
 
 
 try:
+    print(f"Caricamento dataset e scaler...")
+
     simulated_data = pd.read_parquet("./sources/olive_training_dataset.parquet")
     weather_data = pd.read_parquet("./sources/weather_data_solarenergy.parquet")
     olive_varieties = pd.read_parquet("./sources/olive_varieties.parquet")
     scaler_temporal = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_temporal.joblib')
     scaler_static = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_static.joblib')
     scaler_y = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_y.joblib')
-
-    config = load_config()
-    DEV_MODE = config.get('inference', {}).get('debug_mode', True)
 except Exception as e:
     print(f"Errore nel caricamento: {str(e)}")
     raise e
 
 
-# Funzioni di supporto per la dashboard
 def prepare_static_features_multiple(varieties_info, percentages, hectares, all_varieties):
     """
     Prepara le feature statiche per multiple varietà seguendo la struttura esatta della simulazione.
@@ -150,7 +168,7 @@ def prepare_static_features_multiple(varieties_info, percentages, hectares, all_
                                   variety_info['Fabbisogno Acqua Estate (m³/ettaro)'] +
                                   variety_info['Fabbisogno Acqua Autunno (m³/ettaro)'] +
                                   variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']
-                          ) / 4 * percentage / 100 * hectares
+                          ) / 12 * percentage / 100 * hectares
 
         variety_data[variety_name].update({
             'pct': percentage / 100,
@@ -265,7 +283,7 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares, si
         total_oil_production = 0
 
         for variety_info, percentage in zip(varieties_info, percentages):
-            print(f"Elaborazione varietà: {variety_info['Varietà di Olive']}")
+            # print(f"Elaborazione varietà: {variety_info['Varietà di Olive']}")
 
             # Calcola la produzione di olive per ettaro
             base_prod_per_ha = float(variety_info['Produzione (tonnellate/ettaro)']) * 1000 * (percentage / 100)
@@ -280,9 +298,9 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares, si
             # Calcolo fabbisogno idrico
             water_need = float(variety_info[season_water_need[current_season]]) * (percentage / 100)
 
-            print(f"  Produzione olive/ha: {prod_per_ha:.2f}")
-            print(f"  Produzione olio/ha: {oil_per_ha:.2f}")
-            print(f"  Fabbisogno idrico: {water_need:.2f}")
+            # print(f"  Produzione olive/ha: {prod_per_ha:.2f}")
+            # print(f"  Produzione olio/ha: {oil_per_ha:.2f}")
+            # print(f"  Fabbisogno idrico: {water_need:.2f}")
 
             variety_details.append({
                 'variety': variety_info['Varietà di Olive'],
@@ -330,6 +348,7 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares, si
 
 
 def make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data=None):
+    print(f"DEV_MODE: {DEV_MODE}")
     if DEV_MODE:
         return mock_make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data)
     try:
@@ -464,11 +483,11 @@ def make_prediction(weather_data, varieties_info, percentages, hectares, simulat
         print("\nRaw prediction:", prediction)
 
         target_features = [
-            'olive_prod',        # Produzione olive kg/ha
-            'min_oil_prod',      # Produzione minima olio L/ha
-            'max_oil_prod',      # Produzione massima olio L/ha
-            'avg_oil_prod',      # Produzione media olio L/ha
-            'total_water_need'   # Fabbisogno idrico totale m³/ha
+            'olive_prod',  # Produzione olive kg/ha
+            'min_oil_prod',  # Produzione minima olio L/ha
+            'max_oil_prod',  # Produzione massima olio L/ha
+            'avg_oil_prod',  # Produzione media olio L/ha
+            'total_water_need'  # Fabbisogno idrico totale m³/ha
         ]
 
         prediction = scaler_y.inverse_transform(prediction)[0]
@@ -481,6 +500,8 @@ def make_prediction(weather_data, varieties_info, percentages, hectares, simulat
             prediction = prediction * stress_factor
             print(f"Applied stress factor: {stress_factor}")
             print(f"Prediction after stress:", prediction)
+
+        prediction[4] = prediction[4] / 4  # correggo il bias creato dai dati di simulazione errati @todo nel prossimo modello addestrato con i dati corretti sarà dovrà essere rimosso
 
         # Calcola i valori per ettaro dividendo per il numero di ettari
         olive_prod_ha = prediction[0] / hectares
@@ -529,19 +550,19 @@ def make_prediction(weather_data, varieties_info, percentages, hectares, simulat
                 'oil_total': oil_total,
                 'water_need': water_need_ha * (percentage / 100),  # Distribuisci il fabbisogno idrico in base alla percentuale
                 'base_production': base_prod_per_ha,  # Produzione senza stress
-                'base_oil': base_oil_per_ha,         # Produzione olio senza stress
+                'base_oil': base_oil_per_ha,  # Produzione olio senza stress
                 'stress_factor': stress_factor if simulation_data is not None else 1.0
             })
 
         return {
-            'olive_production': olive_prod_ha,          # kg/ha
-            'olive_production_total': prediction[0],    # kg totali
-            'min_oil_production': min_oil_prod_ha,      # L/ha
-            'max_oil_production': max_oil_prod_ha,      # L/ha
-            'avg_oil_production': avg_oil_prod_ha,      # L/ha
+            'olive_production': olive_prod_ha,  # kg/ha
+            'olive_production_total': prediction[0],  # kg totali
+            'min_oil_production': min_oil_prod_ha,  # L/ha
+            'max_oil_production': max_oil_prod_ha,  # L/ha
+            'avg_oil_production': avg_oil_prod_ha,  # L/ha
             'avg_oil_production_total': prediction[3],  # L totali
-            'water_need': water_need_ha,               # m³/ha
-            'water_need_total': prediction[4],         # m³ totali
+            'water_need': water_need_ha,  # m³/ha
+            'water_need_total': prediction[4],  # m³ totali
             'variety_details': variety_details,
             'hectares': hectares,
             'stress_factor': stress_factor if simulation_data is not None else 1.0
@@ -699,583 +720,68 @@ def create_kpi_indicators(kpis: dict) -> html.Div:
     return indicators
 
 
+server = flask.Flask(__name__)
+server.secret_key = utils.SECRET_KEY
+
 app = Dash(
     __name__,
     external_stylesheets=[dbc.themes.FLATLY],
+    server=server,
     meta_tags=[
         {"name": "viewport", "content": "width=device-width, initial-scale=1"}
     ],
-    prevent_initial_callbacks='initial_duplicate'
+    prevent_initial_callbacks='initial_duplicate',
+    suppress_callback_exceptions=True
 )
 
 # Stili comuni
 CARD_STYLE = {
     "height": "100%",
-    "margin-bottom": "15px"
+    "marginBottom": "15px"
 }
 
 CARD_BODY_STYLE = {
     "padding": "15px"
 }
 
-# Modifiche al layout - aggiungi tooltips per chiarire la funzionalità
-variety2_tooltip = dbc.Tooltip(
-    "Seleziona una seconda varietà per creare un mix",
-    target="variety-2-dropdown",
-    placement="top"
-)
-
-variety3_tooltip = dbc.Tooltip(
-    "Seleziona una terza varietà per completare il mix",
-    target="variety-3-dropdown",
-    placement="top"
-)
-
-
-def create_configuration_tab():
-    return dbc.Tab([
-        dbc.Row([
-            # Configurazione Oliveto
-            dbc.Col([
-                create_costs_config_section()
-            ], md=6),
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader([
-                        html.H4("Configurazione Oliveto", className="text-primary mb-0"),
-                    ], className="bg-light"),
-                    dbc.CardBody([
-                        # Hectares input
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Label("Ettari totali:", className="fw-bold"),
-                                dbc.Input(
-                                    id='hectares-input',
-                                    type='number',
-                                    value=1,
-                                    min=1,
-                                    className="mb-3"
-                                )
-                            ])
-                        ]),
-
-                        # Variety sections
-                        html.Div([
-                            # Variety 1
-                            html.Div([
-                                html.H6("Varietà 1", className="text-primary mb-3"),
-                                dbc.Row([
-                                    dbc.Col([
-                                        dbc.Label("Varietà:", className="fw-bold"),
-                                        dcc.Dropdown(
-                                            id='variety-1-dropdown',
-                                            options=[{'label': v, 'value': v}
-                                                     for v in olive_varieties['Varietà di Olive'].unique()],
-                                            value=olive_varieties['Varietà di Olive'].iloc[0],
-                                            className="mb-2"
-                                        ),
-                                    ], md=4),
-                                    dbc.Col([
-                                        dbc.Label("Tecnica:", className="fw-bold"),
-                                        dcc.Dropdown(
-                                            id='technique-1-dropdown',
-                                            options=[
-                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
-                                                {'label': 'Intensiva', 'value': 'intensiva'},
-                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
-                                            ],
-                                            value='Tradizionale',
-                                            className="mb-2"
-                                        ),
-                                    ], md=4),
-                                    dbc.Col([
-                                        dbc.Label("Percentuale:", className="fw-bold"),
-                                        dbc.Input(
-                                            id='percentage-1-input',
-                                            type='number',
-                                            min=1,
-                                            max=100,
-                                            value=100,
-                                            className="mb-2"
-                                        )
-                                    ], md=4)
-                                ])
-                            ], className="mb-4"),
-
-                            # Variety 2
-                            html.Div([
-                                html.H6("Varietà 2 (opzionale)", className="text-primary mb-3"),
-                                dbc.Row([
-                                    dbc.Col([
-                                        dbc.Label("Varietà:", className="fw-bold"),
-                                        dcc.Dropdown(
-                                            id='variety-2-dropdown',
-                                            options=[{'label': v, 'value': v}
-                                                     for v in olive_varieties['Varietà di Olive'].unique()],
-                                            value=None,
-                                            className="mb-2"
-                                        ),
-                                    ], md=4),
-                                    dbc.Col([
-                                        dbc.Label("Tecnica:", className="fw-bold"),
-                                        dcc.Dropdown(
-                                            id='technique-2-dropdown',
-                                            options=[
-                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
-                                                {'label': 'Intensiva', 'value': 'intensiva'},
-                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
-                                            ],
-                                            value=None,
-                                            disabled=True,
-                                            className="mb-2"
-                                        ),
-                                    ], md=4),
-                                    dbc.Col([
-                                        dbc.Label("Percentuale:", className="fw-bold"),
-                                        dbc.Input(
-                                            id='percentage-2-input',
-                                            type='number',
-                                            min=0,
-                                            max=99,
-                                            value=0,
-                                            disabled=True,
-                                            className="mb-2"
-                                        )
-                                    ], md=4)
-                                ])
-                            ], className="mb-4"),
-
-                            # Variety 3
-                            html.Div([
-                                html.H6("Varietà 3 (opzionale)", className="text-primary mb-3"),
-                                dbc.Row([
-                                    dbc.Col([
-                                        dbc.Label("Varietà:", className="fw-bold"),
-                                        dcc.Dropdown(
-                                            id='variety-3-dropdown',
-                                            options=[{'label': v, 'value': v}
-                                                     for v in olive_varieties['Varietà di Olive'].unique()],
-                                            value=None,
-                                            className="mb-2"
-                                        ),
-                                    ], md=4),
-                                    dbc.Col([
-                                        dbc.Label("Tecnica:", className="fw-bold"),
-                                        dcc.Dropdown(
-                                            id='technique-3-dropdown',
-                                            options=[
-                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
-                                                {'label': 'Intensiva', 'value': 'intensiva'},
-                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
-                                            ],
-                                            value=None,
-                                            disabled=True,
-                                            className="mb-2"
-                                        ),
-                                    ], md=4),
-                                    dbc.Col([
-                                        dbc.Label("Percentuale:", className="fw-bold"),
-                                        dbc.Input(
-                                            id='percentage-3-input',
-                                            type='number',
-                                            min=0,
-                                            max=99,
-                                            value=0,
-                                            disabled=True,
-                                            className="mb-2"
-                                        )
-                                    ], md=4)
-                                ])
-                            ], className="mb-4"),
-                        ]),
-
-                        # Warning message
-                        html.Div(
-                            id='percentage-warning',
-                            className="text-danger mt-3"
-                        )
-                    ])
-                ], className="mb-4")
-            ], md=6),
-            dbc.Row([
-                dbc.Col([
-                    create_inference_config_section()
-                ], md=12)
-            ]),
-            # Configurazione Costi
-            html.Div([
-                dbc.Button(
-                    "Salva Configurazione",
-                    id="save-config-button",
-                    color="primary",
-                    className="mt-3"
-                ),
-                html.Div(
-                    id="save-config-message",
-                    className="mt-2"
-                )
-            ], className="text-center")
-        ])
-    ], label="Configurazione", tab_id="tab-config")
-
-
-@app.callback(
-    Output('loading-alert', 'children'),
-    [Input('simulate-btn', 'n_clicks'),
-     Input('debug-switch', 'value')]
-)
-def update_loading_status(n_clicks, debug_mode):
-    if MODEL_LOADING:
-        return dbc.Alert(
-            [
-                html.I(className="fas fa-spinner fa-spin me-2"),
-                "Caricamento del modello in corso..."
-            ],
-            color="warning",
-            is_open=True
-        )
-    return None
-
-
-@app.callback(
-    [Output('inference-status', 'children'),
-     Output('inference-mode', 'children'),
-     Output('inference-latency', 'children'),
-     Output('inference-requests', 'children')],
-    [Input('debug-switch', 'value')]
-)
-def toggle_inference_mode(debug_mode):
-    global DEV_MODE, model, MODEL_LOADING, scaler_temporal, scaler_static, scaler_y
-    try:
-        config = load_config()
-
-        # Aggiorna la modalità debug nella configurazione
-        config['inference'] = config.get('inference', {})  # Crea la sezione se non esiste
-        config['inference']['debug_mode'] = debug_mode
-
-        # Salva la configurazione aggiornata
-        try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(config, f, indent=4)
-        except Exception as e:
-            print(f"Errore nel salvataggio della configurazione: {e}")
-
-        DEV_MODE = debug_mode
-
-        if debug_mode:
-            MODEL_LOADING = False
-            model = None
-            return (
-                dbc.Alert("Modalità Debug attiva - Using mock predictions", color="info"),
-                "Debug (Mock)",
-                "< 1ms",
-                "N/A"
-            )
-        else:
-            try:
-                MODEL_LOADING = True
-                print(f"Keras version: {keras.__version__}")
-                print(f"TensorFlow version: {tf.__version__}")
-                print(f"CUDA available: {tf.test.is_built_with_cuda()}")
-                print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
-
-                # GPU memory configuration
-                gpus = tf.config.experimental.list_physical_devices('GPU')
-                if gpus:
-                    try:
-                        for gpu in gpus:
-                            tf.config.experimental.set_memory_growth(gpu, True)
-
-                        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-                        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-                    except RuntimeError as e:
-                        print(e)
-
-                @keras.saving.register_keras_serializable()
-                class DataAugmentation(tf.keras.layers.Layer):
-                    """Custom layer per l'augmentation dei dati"""
-
-                    def __init__(self, noise_stddev=0.03, **kwargs):
-                        super().__init__(**kwargs)
-                        self.noise_stddev = noise_stddev
-
-                    def call(self, inputs, training=None):
-                        if training:
-                            return inputs + tf.random.normal(
-                                shape=tf.shape(inputs),
-                                mean=0.0,
-                                stddev=self.noise_stddev
-                            )
-                        return inputs
-
-                    def get_config(self):
-                        config = super().get_config()
-                        config.update({"noise_stddev": self.noise_stddev})
-                        return config
-
-                @keras.saving.register_keras_serializable()
-                class PositionalEncoding(tf.keras.layers.Layer):
-                    """Custom layer per l'encoding posizionale"""
-
-                    def __init__(self, d_model, **kwargs):
-                        super().__init__(**kwargs)
-                        self.d_model = d_model
-
-                    def build(self, input_shape):
-                        _, seq_length, _ = input_shape
-
-                        # Crea la matrice di encoding posizionale
-                        position = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
-                        div_term = tf.exp(
-                            tf.range(0, self.d_model, 2, dtype=tf.float32) *
-                            (-tf.math.log(10000.0) / self.d_model)
-                        )
-
-                        # Calcola sin e cos
-                        pos_encoding = tf.zeros((1, seq_length, self.d_model))
-                        pos_encoding_even = tf.sin(position * div_term)
-                        pos_encoding_odd = tf.cos(position * div_term)
-
-                        # Assegna i valori alle posizioni pari e dispari
-                        pos_encoding = tf.concat(
-                            [tf.expand_dims(pos_encoding_even, -1),
-                             tf.expand_dims(pos_encoding_odd, -1)],
-                            axis=-1
-                        )
-                        pos_encoding = tf.reshape(pos_encoding, (1, seq_length, -1))
-                        pos_encoding = pos_encoding[:, :, :self.d_model]
-
-                        # Salva l'encoding come peso non trainabile
-                        self.pos_encoding = self.add_weight(
-                            shape=(1, seq_length, self.d_model),
-                            initializer=tf.keras.initializers.Constant(pos_encoding),
-                            trainable=False,
-                            name='positional_encoding'
-                        )
-
-                        super().build(input_shape)
-
-                    def call(self, inputs):
-                        # Broadcast l'encoding posizionale sul batch
-                        batch_size = tf.shape(inputs)[0]
-                        pos_encoding_tiled = tf.tile(self.pos_encoding, [batch_size, 1, 1])
-                        return inputs + pos_encoding_tiled
-
-                    def get_config(self):
-                        config = super().get_config()
-                        config.update({"d_model": self.d_model})
-                        return config
-
-                @keras.saving.register_keras_serializable()
-                class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-                    """Custom learning rate schedule with linear warmup and exponential decay."""
-
-                    def __init__(self, initial_learning_rate=1e-3, warmup_steps=500, decay_steps=5000):
-                        super().__init__()
-                        self.initial_learning_rate = initial_learning_rate
-                        self.warmup_steps = warmup_steps
-                        self.decay_steps = decay_steps
-
-                    def __call__(self, step):
-                        warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
-                        warmup_lr = self.initial_learning_rate * warmup_pct
-                        decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
-                        decayed_lr = self.initial_learning_rate * decay_factor
-                        return tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
-
-                    def get_config(self):
-                        return {
-                            'initial_learning_rate': self.initial_learning_rate,
-                            'warmup_steps': self.warmup_steps,
-                            'decay_steps': self.decay_steps
-                        }
-
-                @keras.saving.register_keras_serializable()
-                def weighted_huber_loss(y_true, y_pred):
-                    # Pesi per diversi output
-                    weights = tf.constant([1.0, 0.8, 0.8, 1.0, 0.6], dtype=tf.float32)
-                    huber = tf.keras.losses.Huber(delta=1.0)
-                    loss = huber(y_true, y_pred)
-                    weighted_loss = tf.reduce_mean(loss * weights)
-                    return weighted_loss
-
-                print("Caricamento modello e scaler...")
-
-                # Verifica che il modello sia disponibile
-                model_path = './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
-                if not os.path.exists(model_path):
-                    raise FileNotFoundError(f"Modello non trovato in: {model_path}")
-
-                # Prova a caricare il modello
-                model = tf.keras.models.load_model(model_path, custom_objects={
-                    'DataAugmentation': DataAugmentation,
-                    'PositionalEncoding': PositionalEncoding,
-                    'WarmUpLearningRateSchedule': WarmUpLearningRateSchedule,
-                    'weighted_huber_loss': weighted_huber_loss
-                })
-                MODEL_LOADING = False
-                return (
-                    dbc.Alert("Modello caricato correttamente", color="success"),
-                    "Produzione (Local Model)",
-                    "~ 100ms",
-                    "0"
-                )
-            except Exception as e:
-                print(f"Errore nel caricamento del modello: {str(e)}")
-                # Se c'è un errore nel caricamento del modello, torna in modalità debug
-                DEV_MODE = True
-                MODEL_LOADING = False
-                return (
-                    dbc.Alert(f"Errore nel caricamento del modello: {str(e)}", color="danger"),
-                    "Debug (Mock) - Fallback",
-                    "N/A",
-                    "N/A"
-                )
-    except Exception as e:
-        print(f"Errore nella configurazione inferenza: {str(e)}")
-        MODEL_LOADING = False
-        return (
-            dbc.Alert(f"Errore: {str(e)}", color="danger"),
-            "Errore",
-            "Errore",
-            "Errore"
-        )
-
-
-def create_economic_analysis_tab():
-    return dbc.Tab([
-        # Sezione Costi di Trasformazione
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader("Costi di Trasformazione"),
-                    dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([
-                                html.H5("Frantoio", className="mb-3"),
-                                dbc.ListGroup([
-                                    dbc.ListGroupItem([
-                                        html.Strong("Molitura: "),
-                                        "€0.15/kg olive"
-                                    ]),
-                                    dbc.ListGroupItem([
-                                        html.Strong("Stoccaggio: "),
-                                        "€0.20/L olio"
-                                    ])
-                                ], flush=True)
-                            ], md=6),
-                            dbc.Col([
-                                html.H5("Imbottigliamento", className="mb-3"),
-                                dbc.ListGroup([
-                                    dbc.ListGroupItem([
-                                        html.Strong("Bottiglia (1L): "),
-                                        "€1.20/unità"
-                                    ]),
-                                    dbc.ListGroupItem([
-                                        html.Strong("Etichettatura: "),
-                                        "€0.30/bottiglia"
-                                    ])
-                                ], flush=True)
-                            ], md=6)
-                        ])
-                    ])
-                ], style=CARD_STYLE)
-            ], md=12)
-        ]),
-
-        # Sezione Ricavi e Guadagni
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader("Analisi Economica"),
-                    dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([
-                                html.H5("Ricavi", className="mb-3"),
-                                dbc.ListGroup([
-                                    dbc.ListGroupItem([
-                                        html.Strong("Prezzo vendita olio: "),
-                                        "€12.00/L"
-                                    ]),
-                                    dbc.ListGroupItem([
-                                        html.Strong("Ricavo totale: "),
-                                        "€48,000.00"
-                                    ])
-                                ], flush=True)
-                            ], md=4),
-                            dbc.Col([
-                                html.H5("Costi Totali", className="mb-3"),
-                                dbc.ListGroup([
-                                    dbc.ListGroupItem([
-                                        html.Strong("Costi produzione: "),
-                                        "€25,000.00"
-                                    ]),
-                                    dbc.ListGroupItem([
-                                        html.Strong("Costi trasformazione: "),
-                                        "€8,000.00"
-                                    ])
-                                ], flush=True)
-                            ], md=4),
-                            dbc.Col([
-                                html.H5("Margini", className="mb-3"),
-                                dbc.ListGroup([
-                                    dbc.ListGroupItem([
-                                        html.Strong("Margine lordo: "),
-                                        "€15,000.00"
-                                    ]),
-                                    dbc.ListGroupItem([
-                                        html.Strong("Margine per litro: "),
-                                        "€3.75/L"
-                                    ])
-                                ], flush=True)
-                            ], md=4)
-                        ])
-                    ])
-                ], style=CARD_STYLE)
-            ], md=12)
-        ]),
-
-        # Grafici Finanziari
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader("Distribuzione Costi"),
-                    dbc.CardBody([
-                        dcc.Graph(
-                            figure=px.pie(
-                                values=[2000, 500, 800, 1500, 600, 400],
-                                names=['Ammortamento', 'Assicurazione', 'Manutenzione',
-                                       'Raccolta', 'Potatura', 'Fertilizzanti'],
-                                title='Distribuzione Costi per Ettaro'
-                            ),
-                            config={'displayModeBar': False}
-                        )
-                    ])
-                ], style=CARD_STYLE)
-            ], md=6),
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader("Analisi Break-Even"),
-                    dbc.CardBody([
-                        dcc.Graph(
-                            figure=px.line(
-                                x=[0, 1000, 2000, 3000, 4000],
-                                y=[[0, 12000, 24000, 36000, 48000],
-                                   [5000, 15000, 25000, 35000, 45000]],
-                                title='Analisi Break-Even',
-                                labels={'x': 'Litri di olio', 'y': 'Euro'}
-                            ),
-                            config={'displayModeBar': False}
-                        )
-                    ])
-                ], style=CARD_STYLE)
-            ], md=6)
-        ])
-    ], label="Analisi Economica", tab_id="tab-financial")
-
 
 def create_production_tab():
     return dbc.Tab([
+        dbc.Row([
+            # Aggiungiamo un card per lo stato del modello
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.H4("Modalità Inferenza", className="text-primary mb-0"),
+                    ], className="bg-light"),
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                html.Div([
+                                    html.P("Stato corrente:", className="mb-2"),
+                                    html.H5(id=Ids.PRODUCTION_INFERENCE_MODE, className="text-info")
+                                ], className="text-center")
+                            ], width=8),
+                            dbc.Col([
+                                dbc.Switch(
+                                    id=Ids.PRODUCTION_DEBUG_SWITCH,
+                                    label="Modalità Debug",
+                                    value=True,
+                                    className="mt-2"
+                                ),
+                            ], width=4),
+                        ]),
+                        html.Hr(),
+                        dbc.Row([
+                            dbc.Col([
+                                html.P("Richieste totali:", className="mb-2"),
+                                html.H5(id=Ids.PRODUCTION_INFERENCE_REQUESTS, className="text-muted")
+                            ], className="text-center")
+                        ])
+                    ])
+                ], className="mb-4"),
+            ], md=12),
+        ]),
         dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -1526,178 +1032,323 @@ def create_environmental_simulation_tab():
     ], label="Simulazione Ambientale")
 
 
-def create_growth_simulation_figure(sim_data: pd.DataFrame) -> go.Figure:
-    """Crea il grafico della simulazione di crescita"""
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+def create_economic_analysis_tab():
+    return dbc.Tab([
+        # Sezione Costi di Trasformazione
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("Costi di Trasformazione"),
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                html.H5("Frantoio", className="mb-3"),
+                                dbc.ListGroup([
+                                    dbc.ListGroupItem([
+                                        html.Strong("Molitura: "),
+                                        "€0.15/kg olive"
+                                    ]),
+                                    dbc.ListGroupItem([
+                                        html.Strong("Stoccaggio: "),
+                                        "€0.20/L olio"
+                                    ])
+                                ], flush=True)
+                            ], md=6),
+                            dbc.Col([
+                                html.H5("Imbottigliamento", className="mb-3"),
+                                dbc.ListGroup([
+                                    dbc.ListGroupItem([
+                                        html.Strong("Bottiglia (1L): "),
+                                        "€1.20/unità"
+                                    ]),
+                                    dbc.ListGroupItem([
+                                        html.Strong("Etichettatura: "),
+                                        "€0.30/bottiglia"
+                                    ])
+                                ], flush=True)
+                            ], md=6)
+                        ])
+                    ])
+                ], style=CARD_STYLE)
+            ], md=12)
+        ]),
 
-    # Aggiunge la linea di crescita
-    fig.add_trace(
-        go.Scatter(
-            x=sim_data['date'],
-            y=sim_data['growth_rate'],
-            name="Tasso di Crescita",
-            line=dict(color='#2E86C1', width=2)
-        ),
-        secondary_y=False
-    )
+        # Sezione Ricavi e Guadagni
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("Analisi Economica"),
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                html.H5("Ricavi", className="mb-3"),
+                                dbc.ListGroup([
+                                    dbc.ListGroupItem([
+                                        html.Strong("Prezzo vendita olio: "),
+                                        "€12.00/L"
+                                    ]),
+                                    dbc.ListGroupItem([
+                                        html.Strong("Ricavo totale: "),
+                                        "€48,000.00"
+                                    ])
+                                ], flush=True)
+                            ], md=4),
+                            dbc.Col([
+                                html.H5("Costi Totali", className="mb-3"),
+                                dbc.ListGroup([
+                                    dbc.ListGroupItem([
+                                        html.Strong("Costi produzione: "),
+                                        "€25,000.00"
+                                    ]),
+                                    dbc.ListGroupItem([
+                                        html.Strong("Costi trasformazione: "),
+                                        "€8,000.00"
+                                    ])
+                                ], flush=True)
+                            ], md=4),
+                            dbc.Col([
+                                html.H5("Margini", className="mb-3"),
+                                dbc.ListGroup([
+                                    dbc.ListGroupItem([
+                                        html.Strong("Margine lordo: "),
+                                        "€15,000.00"
+                                    ]),
+                                    dbc.ListGroupItem([
+                                        html.Strong("Margine per litro: "),
+                                        "€3.75/L"
+                                    ])
+                                ], flush=True)
+                            ], md=4)
+                        ])
+                    ])
+                ], style=CARD_STYLE)
+            ], md=12)
+        ]),
 
-    # Aggiunge l'indice di stress
-    fig.add_trace(
-        go.Scatter(
-            x=sim_data['date'],
-            y=sim_data['stress_index'],
-            name="Indice di Stress",
-            line=dict(color='#E74C3C', width=2)
-        ),
-        secondary_y=True
-    )
-
-    # Aggiungi indicatori delle fasi
-    for phase in sim_data['phase'].unique():
-        phase_data = sim_data[sim_data['phase'] == phase]
-        fig.add_trace(
-            go.Scatter(
-                x=[phase_data['date'].iloc[0]],
-                y=[0],
-                name=phase,
-                mode='markers+text',
-                text=[phase],
-                textposition='top center',
-                marker=dict(size=10)
-            ),
-            secondary_y=False
-        )
-
-    # Configurazione layout
-    fig.update_layout(
-        title='Simulazione Crescita e Stress Ambientale',
-        xaxis_title='Data',
-        yaxis_title='Tasso di Crescita (%)',
-        yaxis2_title='Indice di Stress',
-        hovermode='x unified',
-        showlegend=True,
-        height=500
-    )
-
-    return fig
+        # Grafici Finanziari
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("Distribuzione Costi"),
+                    dbc.CardBody([
+                        dcc.Graph(
+                            figure=px.pie(
+                                values=[2000, 500, 800, 1500, 600, 400],
+                                names=['Ammortamento', 'Assicurazione', 'Manutenzione',
+                                       'Raccolta', 'Potatura', 'Fertilizzanti'],
+                                title='Distribuzione Costi per Ettaro'
+                            ),
+                            config={'displayModeBar': False}
+                        )
+                    ])
+                ], style=CARD_STYLE)
+            ], md=6),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("Analisi Break-Even"),
+                    dbc.CardBody([
+                        dcc.Graph(
+                            figure=px.line(
+                                x=[0, 1000, 2000, 3000, 4000],
+                                y=[[0, 12000, 24000, 36000, 48000],
+                                   [5000, 15000, 25000, 35000, 45000]],
+                                title='Analisi Break-Even',
+                                labels={'x': 'Litri di olio', 'y': 'Euro'}
+                            ),
+                            config={'displayModeBar': False}
+                        )
+                    ])
+                ], style=CARD_STYLE)
+            ], md=6)
+        ])
+    ], label="Analisi Economica", tab_id="tab-financial")
 
 
-def create_production_impact_figure(sim_data: pd.DataFrame) -> go.Figure:
-    """
-    Crea il grafico dell'impatto sulla produzione, con gestione corretta del resampling mensile.
+def create_configuration_tab():
+    return dbc.Tab([
+        dbc.Row([
+            # Configurazione Oliveto
+            dbc.Col([
+                create_costs_config_section()
+            ], md=6),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.H4("Configurazione Oliveto", className="text-primary mb-0"),
+                    ], className="bg-light"),
+                    dbc.CardBody([
+                        # Hectares input
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Ettari totali:", className="fw-bold"),
+                                dbc.Input(
+                                    id='hectares-input',
+                                    type='number',
+                                    value=1,
+                                    min=1,
+                                    className="mb-3"
+                                )
+                            ])
+                        ]),
 
-    Parameters
-    ----------
-    sim_data : pd.DataFrame
-        DataFrame contenente i dati della simulazione con colonne:
-        - date: datetime
-        - stress_index: float
-        - phase: str
-        - temperature: float
-        - growth_rate: float
+                        # Variety sections
+                        html.Div([
+                            # Variety 1
+                            html.Div([
+                                html.H6("Varietà 1", className="text-primary mb-3"),
+                                dbc.Row([
+                                    dbc.Col([
+                                        dbc.Label("Varietà:", className="fw-bold"),
+                                        dcc.Dropdown(
+                                            id='variety-1-dropdown',
+                                            options=[{'label': v, 'value': v}
+                                                     for v in olive_varieties['Varietà di Olive'].unique()],
+                                            value=olive_varieties['Varietà di Olive'].iloc[0],
+                                            className="mb-2"
+                                        ),
+                                    ], md=4),
+                                    dbc.Col([
+                                        dbc.Label("Tecnica:", className="fw-bold"),
+                                        dcc.Dropdown(
+                                            id='technique-1-dropdown',
+                                            options=[
+                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
+                                                {'label': 'Intensiva', 'value': 'intensiva'},
+                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
+                                            ],
+                                            value='Tradizionale',
+                                            className="mb-2"
+                                        ),
+                                    ], md=4),
+                                    dbc.Col([
+                                        dbc.Label("Percentuale:", className="fw-bold"),
+                                        dbc.Input(
+                                            id='percentage-1-input',
+                                            type='number',
+                                            min=1,
+                                            max=100,
+                                            value=100,
+                                            className="mb-2"
+                                        )
+                                    ], md=4)
+                                ])
+                            ], className="mb-4"),
 
-    Returns
-    -------
-    go.Figure
-        Figura Plotly con il grafico dell'impatto sulla produzione
-    """
-    # Verifica che la colonna date sia datetime
-    if not pd.api.types.is_datetime64_any_dtype(sim_data['date']):
-        sim_data['date'] = pd.to_datetime(sim_data['date'])
+                            # Variety 2
+                            html.Div([
+                                html.H6("Varietà 2 (opzionale)", className="text-primary mb-3"),
+                                dbc.Row([
+                                    dbc.Col([
+                                        dbc.Label("Varietà:", className="fw-bold"),
+                                        dcc.Dropdown(
+                                            id='variety-2-dropdown',
+                                            options=[{'label': v, 'value': v}
+                                                     for v in olive_varieties['Varietà di Olive'].unique()],
+                                            value=None,
+                                            className="mb-2"
+                                        ),
+                                    ], md=4),
+                                    dbc.Col([
+                                        dbc.Label("Tecnica:", className="fw-bold"),
+                                        dcc.Dropdown(
+                                            id='technique-2-dropdown',
+                                            options=[
+                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
+                                                {'label': 'Intensiva', 'value': 'intensiva'},
+                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
+                                            ],
+                                            value=None,
+                                            disabled=True,
+                                            className="mb-2"
+                                        ),
+                                    ], md=4),
+                                    dbc.Col([
+                                        dbc.Label("Percentuale:", className="fw-bold"),
+                                        dbc.Input(
+                                            id='percentage-2-input',
+                                            type='number',
+                                            min=0,
+                                            max=99,
+                                            value=0,
+                                            disabled=True,
+                                            className="mb-2"
+                                        )
+                                    ], md=4)
+                                ])
+                            ], className="mb-4"),
 
-    # Setta l'indice come datetime
-    sim_data_indexed = sim_data.set_index('date')
+                            # Variety 3
+                            html.Div([
+                                html.H6("Varietà 3 (opzionale)", className="text-primary mb-3"),
+                                dbc.Row([
+                                    dbc.Col([
+                                        dbc.Label("Varietà:", className="fw-bold"),
+                                        dcc.Dropdown(
+                                            id='variety-3-dropdown',
+                                            options=[{'label': v, 'value': v}
+                                                     for v in olive_varieties['Varietà di Olive'].unique()],
+                                            value=None,
+                                            className="mb-2"
+                                        ),
+                                    ], md=4),
+                                    dbc.Col([
+                                        dbc.Label("Tecnica:", className="fw-bold"),
+                                        dcc.Dropdown(
+                                            id='technique-3-dropdown',
+                                            options=[
+                                                {'label': 'Tradizionale', 'value': 'tradizionale'},
+                                                {'label': 'Intensiva', 'value': 'intensiva'},
+                                                {'label': 'Superintensiva', 'value': 'superintensiva'}
+                                            ],
+                                            value=None,
+                                            disabled=True,
+                                            className="mb-2"
+                                        ),
+                                    ], md=4),
+                                    dbc.Col([
+                                        dbc.Label("Percentuale:", className="fw-bold"),
+                                        dbc.Input(
+                                            id='percentage-3-input',
+                                            type='number',
+                                            min=0,
+                                            max=99,
+                                            value=0,
+                                            disabled=True,
+                                            className="mb-2"
+                                        )
+                                    ], md=4)
+                                ])
+                            ], className="mb-4"),
+                        ]),
 
-    # Calcola medie mensili solo per le colonne numeriche
-    numeric_columns = ['stress_index', 'temperature', 'growth_rate']
-    monthly_means = {}
-
-    for col in numeric_columns:
-        if col in sim_data_indexed.columns:
-            monthly_means[col] = sim_data_indexed[col].resample('ME').mean()
-
-    # Crea DataFrame con le medie mensili
-    monthly_data = pd.DataFrame(monthly_means)
-
-    # Crea la figura
-    fig = go.Figure()
-
-    # Calcola la produzione stimata (100% - stress%)
-    production_estimate = 100 * (1 - monthly_data['stress_index'])
-
-    # Aggiungi traccia principale
-    fig.add_trace(
-        go.Bar(
-            x=monthly_data.index,
-            y=production_estimate,
-            name='Produzione Stimata (%)',
-            marker_color='#27AE60'
-        )
-    )
-
-    # Aggiungi linea di trend
-    fig.add_trace(
-        go.Scatter(
-            x=monthly_data.index,
-            y=production_estimate.rolling(window=3, min_periods=1).mean(),
-            name='Trend (Media Mobile 3 mesi)',
-            line=dict(color='#2C3E50', width=2, dash='dot')
-        )
-    )
-
-    # Configura il layout
-    fig.update_layout(
-        title={
-            'text': 'Impatto Stimato sulla Produzione',
-            'x': 0.5,
-            'xanchor': 'center',
-            'font': dict(size=20)
-        },
-        xaxis_title='Mese',
-        yaxis_title='Produzione Stimata (%)',
-        hovermode='x unified',
-        showlegend=True,
-        height=500,
-        template='plotly_white',
-        yaxis=dict(
-            range=[0, 100],
-            tickformat='.0f',
-            ticksuffix='%'
-        ),
-        xaxis=dict(
-            tickformat='%B %Y',
-            tickangle=45
-        ),
-        legend=dict(
-            yanchor="top",
-            y=0.99,
-            xanchor="left",
-            x=0.01
-        ),
-        margin=dict(t=80, b=80)
-    )
-
-    # Aggiungi annotazioni per valori estremi
-    min_prod = production_estimate.min()
-    max_prod = production_estimate.max()
-
-    fig.add_annotation(
-        x=production_estimate.idxmin(),
-        y=min_prod,
-        text=f"Min: {min_prod:.1f}%",
-        showarrow=True,
-        arrowhead=1
-    )
-
-    fig.add_annotation(
-        x=production_estimate.idxmax(),
-        y=max_prod,
-        text=f"Max: {max_prod:.1f}%",
-        showarrow=True,
-        arrowhead=1
-    )
-
-    return fig
+                        # Warning message
+                        html.Div(
+                            id='percentage-warning',
+                            className="text-danger mt-3"
+                        )
+                    ])
+                ], className="mb-4")
+            ], md=6),
+            dbc.Row([
+                dbc.Col([
+                    create_inference_config_section()
+                ], md=12)
+            ]),
+            # Configurazione Costi
+            html.Div([
+                dbc.Button(
+                    "Salva Configurazione",
+                    id="save-config-button",
+                    color="primary",
+                    className="mt-3"
+                ),
+                html.Div(
+                    id="save-config-message",
+                    className="mt-2"
+                )
+            ], className="text-center")
+        ])
+    ], label="Configurazione", tab_id="tab-config")
 
 
 def create_costs_config_section():
@@ -1906,105 +1557,294 @@ def create_costs_config_section():
 
 
 def create_inference_config_section():
-    config = load_config()
-    debug_mode = config.get('inference', {}).get('debug_mode', True)
-
     return dbc.Card([
-        dbc.CardHeader([
-            html.H4("Configurazione Inferenza", className="text-primary mb-0"),
-            dbc.Switch(
-                id='debug-switch',
-                label="Modalità Debug",
-                value=debug_mode,
-                className="mt-2"
-            ),
-        ], className="bg-light"),
-        dbc.CardBody([
-            # Stato del servizio
-            dbc.Row([
-                dbc.Col([
-                    html.Div([
-                        html.H5("Stato Servizio", className="mb-3"),
-                        html.Div(id='inference-status', className="mb-3"),
-                    ])
-                ])
-            ], className="mb-4"),
-
-            # Configurazioni
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Configurazioni", className="mb-3"),
-                    dbc.Form([
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Label("Modello:", className="fw-bold"),
-                                # Usa html.Div invece di dbc.Input per il percorso in sola lettura
-                                html.Div(
-                                    "./sources/olive_oil_transformer/olive_oil_transformer_model.keras",
-                                    id='model-path',
-                                    className="mb-2 p-2 bg-light border rounded",
-                                    style={
-                                        "font-family": "monospace",
-                                        "font-size": "0.9rem"
-                                    }
-                                )
-                            ], md=12),
-                        ]),
-                    ])
-                ])
-            ]),
-
-            # Metriche e monitoraggio
-            dbc.Row([
-                dbc.Col([
-                    html.H5("Metriche", className="mb-3"),
-                    dbc.ListGroup([
-                        dbc.ListGroupItem([
-                            html.Strong("Modalità: "),
-                            html.Span(id='inference-mode')
-                        ]),
-                        dbc.ListGroupItem([
-                            html.Strong("Latenza media: "),
-                            html.Span(id='inference-latency')
-                        ]),
-                        dbc.ListGroupItem([
-                            html.Strong("Richieste totali: "),
-                            html.Span(id='inference-requests')
+        html.Div(id=Ids.INFERENCE_CONTAINER, children=[
+            dbc.CardHeader([
+                html.H4("Configurazione Inferenza", className="text-primary mb-0"),
+                dbc.Switch(
+                    id=Ids.DEBUG_SWITCH,
+                    label="Modalità Debug",
+                    value=True,
+                    className="mt-2"
+                ),
+            ], className="bg-light"),
+            dbc.CardBody([
+                # Stato del servizio
+                dbc.Row([
+                    dbc.Col([
+                        html.Div([
+                            html.H5("Stato Servizio", className="mb-3"),
+                            html.Div(id=Ids.INFERENCE_STATUS, className="mb-3"),
                         ])
-                    ], flush=True)
-                ])
-            ], className="mt-4")
+                    ])
+                ], className="mb-4"),
+
+                # Metriche e monitoraggio
+                dbc.Row([
+                    dbc.Col([
+                        html.H5("Metriche", className="mb-3"),
+                        dbc.ListGroup([
+                            dbc.ListGroupItem([
+                                html.Strong("Modalità: "),
+                                html.Span(id=Ids.INFERENCE_MODE)
+                            ]),
+                            dbc.ListGroupItem([
+                                html.Strong("Latenza media: "),
+                                html.Span(id=Ids.INFERENCE_LATENCY)
+                            ]),
+                            dbc.ListGroupItem([
+                                html.Strong("Richieste totali: "),
+                                html.Span(id=Ids.INFERENCE_REQUESTS)
+                            ])
+                        ], flush=True)
+                    ])
+                ], className="mt-4")
+            ])
         ])
     ])
 
 
-app.layout = dbc.Container([
-    dcc.Location(id='_pages_location'),
-    html.Div(id='loading-alert'),
-    variety2_tooltip,
-    variety3_tooltip,
-    # Header
-    dbc.Row([
-        dbc.Col([
-            html.Div([
-                html.H1("Dashboard Produzione Olio d'Oliva",
-                        className="text-primary text-center mb-3")
-            ], className="mt-4 mb-4")
-        ])
-    ]),
+def create_growth_simulation_figure(sim_data: pd.DataFrame) -> go.Figure:
+    """Crea il grafico della simulazione di crescita"""
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # Main content
-    dbc.Row([
-        dbc.Col([
-            dbc.Tabs([
-                create_production_tab(),
-                create_environmental_simulation_tab(),
-                create_economic_analysis_tab(),
-                create_configuration_tab(),
-            ], id="tabs", active_tab="tab-production")
-        ], md=12, lg=12)
-    ])
-], fluid=True, className="px-4 py-3")
+    # Aggiunge la linea di crescita
+    fig.add_trace(
+        go.Scatter(
+            x=sim_data['date'],
+            y=sim_data['growth_rate'],
+            name="Tasso di Crescita",
+            line=dict(color='#2E86C1', width=2)
+        ),
+        secondary_y=False
+    )
+
+    # Aggiunge l'indice di stress
+    fig.add_trace(
+        go.Scatter(
+            x=sim_data['date'],
+            y=sim_data['stress_index'],
+            name="Indice di Stress",
+            line=dict(color='#E74C3C', width=2)
+        ),
+        secondary_y=True
+    )
+
+    # Aggiungi indicatori delle fasi
+    for phase in sim_data['phase'].unique():
+        phase_data = sim_data[sim_data['phase'] == phase]
+        fig.add_trace(
+            go.Scatter(
+                x=[phase_data['date'].iloc[0]],
+                y=[0],
+                name=phase,
+                mode='markers+text',
+                text=[phase],
+                textposition='top center',
+                marker=dict(size=10)
+            ),
+            secondary_y=False
+        )
+
+    # Configurazione layout
+    fig.update_layout(
+        title='Simulazione Crescita e Stress Ambientale',
+        xaxis_title='Data',
+        yaxis_title='Tasso di Crescita (%)',
+        yaxis2_title='Indice di Stress',
+        hovermode='x unified',
+        showlegend=True,
+        height=500
+    )
+
+    return fig
+
+
+def create_production_impact_figure(sim_data: pd.DataFrame) -> go.Figure:
+    """
+    Crea il grafico dell'impatto sulla produzione, con gestione corretta del resampling mensile.
+
+    Parameters
+    ----------
+    sim_data : pd.DataFrame
+        DataFrame contenente i dati della simulazione con colonne:
+        - date: datetime
+        - stress_index: float
+        - phase: str
+        - temperature: float
+        - growth_rate: float
+
+    Returns
+    -------
+    go.Figure
+        Figura Plotly con il grafico dell'impatto sulla produzione
+    """
+    # Verifica che la colonna date sia datetime
+    if not pd.api.types.is_datetime64_any_dtype(sim_data['date']):
+        sim_data['date'] = pd.to_datetime(sim_data['date'])
+
+    # Setta l'indice come datetime
+    sim_data_indexed = sim_data.set_index('date')
+
+    # Calcola medie mensili solo per le colonne numeriche
+    numeric_columns = ['stress_index', 'temperature', 'growth_rate']
+    monthly_means = {}
+
+    for col in numeric_columns:
+        if col in sim_data_indexed.columns:
+            monthly_means[col] = sim_data_indexed[col].resample('ME').mean()
+
+    # Crea DataFrame con le medie mensili
+    monthly_data = pd.DataFrame(monthly_means)
+
+    # Crea la figura
+    fig = go.Figure()
+
+    # Calcola la produzione stimata (100% - stress%)
+    production_estimate = 100 * (1 - monthly_data['stress_index'])
+
+    # Aggiungi traccia principale
+    fig.add_trace(
+        go.Bar(
+            x=monthly_data.index,
+            y=production_estimate,
+            name='Produzione Stimata (%)',
+            marker_color='#27AE60'
+        )
+    )
+
+    # Aggiungi linea di trend
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_data.index,
+            y=production_estimate.rolling(window=3, min_periods=1).mean(),
+            name='Trend (Media Mobile 3 mesi)',
+            line=dict(color='#2C3E50', width=2, dash='dot')
+        )
+    )
+
+    # Configura il layout
+    fig.update_layout(
+        title={
+            'text': 'Impatto Stimato sulla Produzione',
+            'x': 0.5,
+            'xanchor': 'center',
+            'font': dict(size=20)
+        },
+        xaxis_title='Mese',
+        yaxis_title='Produzione Stimata (%)',
+        hovermode='x unified',
+        showlegend=True,
+        height=500,
+        template='plotly_white',
+        yaxis=dict(
+            range=[0, 100],
+            tickformat='.0f',
+            ticksuffix='%'
+        ),
+        xaxis=dict(
+            tickformat='%B %Y',
+            tickangle=45
+        ),
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        ),
+        margin=dict(t=80, b=80)
+    )
+
+    # Aggiungi annotazioni per valori estremi
+    min_prod = production_estimate.min()
+    max_prod = production_estimate.max()
+
+    fig.add_annotation(
+        x=production_estimate.idxmin(),
+        y=min_prod,
+        text=f"Min: {min_prod:.1f}%",
+        showarrow=True,
+        arrowhead=1
+    )
+
+    fig.add_annotation(
+        x=production_estimate.idxmax(),
+        y=max_prod,
+        text=f"Max: {max_prod:.1f}%",
+        showarrow=True,
+        arrowhead=1
+    )
+
+    return fig
+
+
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+    dcc.Store(id='session', storage_type='local'),
+    dcc.Store(id='user-data', storage_type='local'),
+    dcc.Store(id=Ids.INFERENCE_COUNTER, storage_type='session', data={'count': 0}),
+    dcc.Store(id=Ids.DEV_MODE, storage_type='session', data={'count': 0}),
+    html.Div(id=Ids.AUTH_CONTAINER),
+    html.Div(id=Ids.DASHBOARD_CONTAINER),
+])
+
+
+def create_main_layout():
+    return dbc.Container([
+        dcc.Location(id='_pages_location'),
+        # Navbar con logout button
+        dbc.Navbar(
+            dbc.Container([
+                dbc.NavbarBrand([
+                    html.I(className="fas fa-leaf me-2"),  # Icona olivo
+                    "Dashboard Produzione Olio d'Oliva"
+                ], className="text-white"),
+                dbc.Nav([
+                    dbc.Button(
+                        [
+                            html.I(className="fas fa-sign-out-alt me-2"),  # Icona logout
+                            "Logout"
+                        ],
+                        id="logout-button",
+                        color="light",
+                        outline=True,
+                        size="sm",
+                        className="ms-2"
+                    )
+                ], className="ms-auto d-flex align-items-center")  # Modificato qui per un migliore allineamento
+            ],
+                fluid=True,  # Aggiunto per sfruttare tutta la larghezza
+            ),
+            color="primary",
+            dark=True,
+            className="mb-3"
+        ),
+        html.Div(id='loading-alert'),
+        dbc.Tooltip(
+            "Seleziona una seconda varietà per creare un mix",
+            target="variety-2-dropdown",
+            placement="top"
+        ),
+        dbc.Tooltip(
+            "Seleziona una terza varietà per completare il mix",
+            target="variety-3-dropdown",
+            placement="top"
+        ),
+        # Header
+        dbc.Row([
+            dbc.Col([
+                dbc.Tabs([
+                    create_production_tab(),
+                    create_environmental_simulation_tab(),
+                    create_economic_analysis_tab(),
+                    create_configuration_tab(),
+                ], id="tabs", active_tab="tab-production")
+            ], md=12, lg=12)
+        ]),
+
+        # Store per dati simulazione
+        dcc.Store(id='simulation-data')
+    ], fluid=True, className="px-4 py-3")
 
 
 def create_extra_info_component(prediction, varieties_info):
@@ -2159,6 +1999,635 @@ def create_extra_info_component(prediction, varieties_info):
     ])
 
 
+def create_figure_layout(fig, title):
+    fig.update_layout(
+        title=title,
+        title_x=0.5,
+        margin=dict(l=20, r=20, t=40, b=20),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        height=350,
+        font=dict(family="Helvetica, Arial, sans-serif"),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    return fig
+
+
+def create_production_details_figure(prediction):
+    """Crea il grafico dei dettagli produzione con il nuovo stile"""
+    details_data = prepare_details_data(prediction)
+    fig = px.bar(
+        details_data,
+        x='Varietà',
+        y='Produzione',
+        color='Tipo',
+        barmode='group',
+        color_discrete_map={'Olive': '#2185d0', 'Olio': '#21ba45'}
+    )
+    return create_figure_layout(fig, 'Dettagli Produzione per Varietà')
+
+
+def create_weather_impact_figure(weather_data):
+    """Crea il grafico dell'impatto meteorologico con il nuovo stile"""
+    recent_weather = weather_data.tail(41).copy()
+    fig = px.scatter(
+        recent_weather,
+        x='temp',
+        y='solarradiation',
+        size='precip',
+        color_discrete_sequence=['#2185d0']
+    )
+    return create_figure_layout(fig, 'Condizioni Meteorologiche')
+
+
+def create_water_needs_figure(prediction):
+    """Crea il grafico del fabbisogno idrico con il nuovo stile"""
+    # Definisci i mesi in italiano
+    months = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
+              'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
+
+    water_data = []
+    for detail in prediction['variety_details']:
+        for month in months:
+            season = get_season_from_month(month)
+            variety_info = olive_varieties[
+                olive_varieties['Varietà di Olive'] == detail['variety']
+                ].iloc[0]
+
+            water_need = variety_info[f'Fabbisogno Acqua {season} (m³/ettaro)']
+            water_data.append({
+                'Month': month,
+                'Variety': detail['variety'],
+                'Water_Need': water_need * (detail['percentage'] / 100)
+            })
+
+    water_df = pd.DataFrame(water_data)
+    fig = px.bar(
+        water_df,
+        x='Month',
+        y='Water_Need',
+        color='Variety',
+        barmode='stack',
+        color_discrete_sequence=['#2185d0', '#21ba45', '#6435c9']
+    )
+
+    return create_figure_layout(fig, 'Fabbisogno Idrico Mensile')
+
+
+def prepare_details_data(prediction):
+    """Prepara i dati per il grafico dei dettagli di produzione"""
+    details_data = []
+
+    # Dati per ogni varietà
+    for detail in prediction['variety_details']:
+        details_data.extend([
+            {
+                'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
+                'Tipo': 'Olive',
+                'Produzione': detail['production_per_ha']
+            },
+            {
+                'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
+                'Tipo': 'Olio',
+                'Produzione': detail['oil_per_ha']
+            }
+        ])
+
+    # Aggiungi totali
+    details_data.extend([
+        {
+            'Varietà': 'Totale',
+            'Tipo': 'Olive',
+            'Produzione': prediction['olive_production']
+        },
+        {
+            'Varietà': 'Totale',
+            'Tipo': 'Olio',
+            'Produzione': prediction['avg_oil_production']
+        }
+    ])
+
+    return pd.DataFrame(details_data)
+
+
+def get_season_from_month(month):
+    """Helper function per determinare la stagione dal mese."""
+    seasons = {
+        'Gen': 'Inverno', 'Feb': 'Inverno', 'Mar': 'Primavera',
+        'Apr': 'Primavera', 'Mag': 'Primavera', 'Giu': 'Estate',
+        'Lug': 'Estate', 'Ago': 'Estate', 'Set': 'Autunno',
+        'Ott': 'Autunno', 'Nov': 'Autunno', 'Dic': 'Inverno'
+    }
+    return seasons[month]
+
+
+@app.callback(
+    Output('loading-alert', 'children'),
+    [Input('simulate-btn', 'n_clicks'),
+     Input('debug-switch', 'value')],
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ]
+)
+def update_loading_status(n_clicks, debug_mode):
+    global DEV_MODE
+
+    config = load_config()
+
+    print(config)
+    DEV_MODE = config['inference']['debug_mode']
+    if MODEL_LOADING:
+        return dbc.Alert(
+            [
+                html.I(className="fas fa-spinner fa-spin me-2"),
+                "Caricamento del modello in corso..."
+            ],
+            color="warning",
+            is_open=True
+        )
+    return None
+
+
+@app.callback(
+    [
+        Output(Ids.PRODUCTION_INFERENCE_MODE, 'children'),
+        Output(Ids.PRODUCTION_INFERENCE_REQUESTS, 'children'),
+        Output(Ids.INFERENCE_COUNTER, 'data', allow_duplicate=True)
+    ],
+    [Input(Ids.PRODUCTION_DEBUG_SWITCH, 'value')],
+    [State(Ids.INFERENCE_COUNTER, 'data')],
+    prevent_initial_call=True
+)
+def update_inference_status(debug_mode, counter_data):
+    try:
+        toggle_inference_mode(debug_mode)
+        mode_text = "Debug (Mock)" if debug_mode else "Produzione (Model)"
+        # Resetta il contatore
+        new_counter_data = {'count': 0}
+        return mode_text, "0", new_counter_data
+    except Exception as e:
+        print(f"Errore nell'aggiornamento dello stato di inferenza: {e}")
+        return "Errore", "N/A", {'count': 0}
+
+
+@app.callback(
+    [
+        Output(Ids.INFERENCE_STATUS, 'children'),
+        Output(Ids.INFERENCE_MODE, 'children', allow_duplicate=True),
+        Output(Ids.INFERENCE_LATENCY, 'children'),
+        Output(Ids.INFERENCE_REQUESTS, 'children', allow_duplicate=True),
+        Output(Ids.INFERENCE_COUNTER, 'data', allow_duplicate=True)
+    ],
+    [Input(Ids.INFERENCE_CONTAINER, 'value')],
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ],
+    prevent_initial_call=True
+)
+def toggle_inference_mode(debug_mode):
+    global DEV_MODE, model, MODEL_LOADING, scaler_temporal, scaler_static, scaler_y
+    new_counter_data = {'count': 0}
+    try:
+        config = load_config()
+        print(f"debug mode: {debug_mode}")
+        # Aggiorna la modalità debug nella configurazione
+        config['inference'] = config.get('inference', {})  # Crea la sezione se non esiste
+        config['inference']['debug_mode'] = debug_mode
+
+        DEV_MODE = debug_mode
+        print(f"DEV_MODE: {DEV_MODE}")
+        dcc.Store(id=Ids.INFERENCE_COUNTER, data=new_counter_data)
+        if debug_mode:
+
+            MODEL_LOADING = False
+            return (
+                dbc.Alert("Modalità Debug attiva - Using mock predictions", color="info"),
+                "Debug (Mock)",
+                "< 1ms",
+                "N/A",
+                new_counter_data
+            )
+        else:
+            if model is None:
+                try:
+                    MODEL_LOADING = True
+                    print(f"Keras version: {keras.__version__}")
+                    print(f"TensorFlow version: {tf.__version__}")
+                    print(f"CUDA available: {tf.test.is_built_with_cuda()}")
+                    print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
+
+                    # GPU memory configuration
+                    gpus = tf.config.experimental.list_physical_devices('GPU')
+                    if gpus:
+                        try:
+                            for gpu in gpus:
+                                tf.config.experimental.set_memory_growth(gpu, True)
+
+                            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+                            print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+                        except RuntimeError as e:
+                            print(e)
+
+                    @keras.saving.register_keras_serializable()
+                    class DataAugmentation(tf.keras.layers.Layer):
+                        """Custom layer per l'augmentation dei dati"""
+
+                        def __init__(self, noise_stddev=0.03, **kwargs):
+                            super().__init__(**kwargs)
+                            self.noise_stddev = noise_stddev
+
+                        def call(self, inputs, training=None):
+                            if training:
+                                return inputs + tf.random.normal(
+                                    shape=tf.shape(inputs),
+                                    mean=0.0,
+                                    stddev=self.noise_stddev
+                                )
+                            return inputs
+
+                        def get_config(self):
+                            config = super().get_config()
+                            config.update({"noise_stddev": self.noise_stddev})
+                            return config
+
+                    @keras.saving.register_keras_serializable()
+                    class PositionalEncoding(tf.keras.layers.Layer):
+                        """Custom layer per l'encoding posizionale"""
+
+                        def __init__(self, d_model, **kwargs):
+                            super().__init__(**kwargs)
+                            self.d_model = d_model
+
+                        def build(self, input_shape):
+                            _, seq_length, _ = input_shape
+
+                            # Crea la matrice di encoding posizionale
+                            position = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
+                            div_term = tf.exp(
+                                tf.range(0, self.d_model, 2, dtype=tf.float32) *
+                                (-tf.math.log(10000.0) / self.d_model)
+                            )
+
+                            # Calcola sin e cos
+                            pos_encoding = tf.zeros((1, seq_length, self.d_model))
+                            pos_encoding_even = tf.sin(position * div_term)
+                            pos_encoding_odd = tf.cos(position * div_term)
+
+                            # Assegna i valori alle posizioni pari e dispari
+                            pos_encoding = tf.concat(
+                                [tf.expand_dims(pos_encoding_even, -1),
+                                 tf.expand_dims(pos_encoding_odd, -1)],
+                                axis=-1
+                            )
+                            pos_encoding = tf.reshape(pos_encoding, (1, seq_length, -1))
+                            pos_encoding = pos_encoding[:, :, :self.d_model]
+
+                            # Salva l'encoding come peso non trainabile
+                            self.pos_encoding = self.add_weight(
+                                shape=(1, seq_length, self.d_model),
+                                initializer=tf.keras.initializers.Constant(pos_encoding),
+                                trainable=False,
+                                name='positional_encoding'
+                            )
+
+                            super().build(input_shape)
+
+                        def call(self, inputs):
+                            # Broadcast l'encoding posizionale sul batch
+                            batch_size = tf.shape(inputs)[0]
+                            pos_encoding_tiled = tf.tile(self.pos_encoding, [batch_size, 1, 1])
+                            return inputs + pos_encoding_tiled
+
+                        def get_config(self):
+                            config = super().get_config()
+                            config.update({"d_model": self.d_model})
+                            return config
+
+                    @keras.saving.register_keras_serializable()
+                    class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+                        """Custom learning rate schedule with linear warmup and exponential decay."""
+
+                        def __init__(self, initial_learning_rate=1e-3, warmup_steps=500, decay_steps=5000):
+                            super().__init__()
+                            self.initial_learning_rate = initial_learning_rate
+                            self.warmup_steps = warmup_steps
+                            self.decay_steps = decay_steps
+
+                        def __call__(self, step):
+                            warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
+                            warmup_lr = self.initial_learning_rate * warmup_pct
+                            decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
+                            decayed_lr = self.initial_learning_rate * decay_factor
+                            return tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
+
+                        def get_config(self):
+                            return {
+                                'initial_learning_rate': self.initial_learning_rate,
+                                'warmup_steps': self.warmup_steps,
+                                'decay_steps': self.decay_steps
+                            }
+
+                    @keras.saving.register_keras_serializable()
+                    def weighted_huber_loss(y_true, y_pred):
+                        # Pesi per diversi output
+                        weights = tf.constant([1.0, 0.8, 0.8, 1.0, 0.6], dtype=tf.float32)
+                        huber = tf.keras.losses.Huber(delta=1.0)
+                        loss = huber(y_true, y_pred)
+                        weighted_loss = tf.reduce_mean(loss * weights)
+                        return weighted_loss
+
+                    print("Caricamento modello...")
+
+                    # Verifica che il modello sia disponibile
+                    model_path = './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
+                    if not os.path.exists(model_path):
+                        raise FileNotFoundError(f"Modello non trovato in: {model_path}")
+
+                    # Prova a caricare il modello
+                    model = tf.keras.models.load_model(model_path, custom_objects={
+                        'DataAugmentation': DataAugmentation,
+                        'PositionalEncoding': PositionalEncoding,
+                        'WarmUpLearningRateSchedule': WarmUpLearningRateSchedule,
+                        'weighted_huber_loss': weighted_huber_loss
+                    })
+                    MODEL_LOADING = False
+                    return (
+                        dbc.Alert("Modello caricato correttamente", color="success"),
+                        "Produzione (Local Model)",
+                        "~ 100ms",
+                        "0",
+                        new_counter_data
+                    )
+                except Exception as e:
+                    print(f"Errore nel caricamento del modello: {str(e)}")
+                    # Se c'è un errore nel caricamento del modello, torna in modalità debug
+                    DEV_MODE = True
+                    MODEL_LOADING = False
+                    return (
+                        dbc.Alert(f"Errore nel caricamento del modello: {str(e)}", color="danger"),
+                        "Debug (Mock) - Fallback",
+                        "N/A",
+                        "N/A",
+                        new_counter_data
+                    )
+
+            else:
+                MODEL_LOADING = False
+    except Exception as e:
+        print(f"Errore nella configurazione inferenza: {str(e)}")
+        MODEL_LOADING = False
+        return (
+            dbc.Alert(f"Errore: {str(e)}", color="danger"),
+            "Errore",
+            "Errore",
+            "Errore",
+            new_counter_data
+        )
+
+
+@app.callback(
+    [
+        Output(Ids.DEBUG_SWITCH, 'value'),
+        Output(Ids.PRODUCTION_DEBUG_SWITCH, 'value')
+    ],
+    [Input('url', 'pathname')],
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ]
+)
+def init_debug_switch(pathname):
+    if pathname != '/':
+        raise PreventUpdate
+    try:
+        config = load_config()
+        return config.get('inference', {}).get('debug_mode', True), config.get('inference', {}).get('debug_mode', True)  # Default a True se non configurato
+    except Exception as e:
+        print(f"Errore nel caricamento della configurazione debug: {str(e)}")
+        return True, True  # Default a True in caso di errore
+
+
+@app.callback(
+    [Output(Ids.AUTH_CONTAINER, 'children'),
+     Output(Ids.DASHBOARD_CONTAINER, 'children')],
+    [Input('url', 'pathname'),
+     Input('session', 'data')],
+)
+def display_page(pathname, session_data):
+    # print(f"Session data: {session_data}")  # Debug print
+
+    if pathname == '/register':
+        return create_register_layout(), html.Div()
+
+    if not session_data:
+        print("No session data found")  # Debug print
+        return create_login_layout(), html.Div()
+
+    if 'token' not in session_data:
+        print("No token in session data")  # Debug print
+        return create_login_layout(), html.Div()
+
+    is_valid, username = verify_token(session_data['token'])
+    if not is_valid:
+        print("Invalid token")  # Debug print
+        return create_login_layout(), html.Div()
+
+    # print(f"Valid session for user: {username}")  # Debug print
+    return html.Div(), create_main_layout()
+
+
+def check_session():
+    """Verifica lo stato della sessione e restituisce i dati se disponibili"""
+    if not flask.has_request_context():
+        print("No request context available")
+        return None
+
+    try:
+        print("\nChecking session...")
+        # Prima prova a leggere dalla sessione corrente
+        if 'user_session' in flask.session:
+            print(f"Found session in flask.session: {flask.session['user_session']}")
+            return flask.session['user_session']
+
+        # Poi prova a leggere dai cookies
+        session_data = flask.request.cookies.get('session')
+        print(f"Session cookie data: {session_data}")
+
+        if session_data:
+            try:
+                session_data = json.loads(session_data)
+                print(f"Parsed session data: {session_data}")
+                if 'username' in session_data:
+                    print(f"Found username in session: {session_data['username']}")
+                    return session_data
+            except json.JSONDecodeError as e:
+                print(f"Error decoding session data: {e}")
+                # Prova a decodificare in base64
+                try:
+                    import base64
+                    decoded = base64.b64decode(session_data)
+                    session_data = json.loads(decoded)
+                    if 'username' in session_data:
+                        print(f"Found username in decoded session: {session_data['username']}")
+                        return session_data
+                except Exception as be:
+                    print(f"Error decoding base64 session: {be}")
+                return None
+    except Exception as e:
+        print(f"Error checking session: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    print("No session data found")
+    return None
+
+
+def save_session_data(username, token):
+    """Salva i dati di sessione sia in Flask che nello store Dash"""
+    session_data = {
+        'token': token,
+        'username': username,
+        'authenticated': True
+    }
+
+    if flask.has_request_context():
+        try:
+            flask.session['user_session'] = session_data
+            print(f'Saved session data in Flask session: {session_data}')
+        except Exception as e:
+            print(f"Error saving to Flask session: {e}")
+
+    return session_data
+
+
+@app.callback(
+    [Output('session', 'data'),
+     Output(Ids.LOGIN_ERROR, 'children'),
+     Output('url', 'pathname', allow_duplicate=True)],
+    [Input(Ids.LOGIN_BUTTON, 'n_clicks')],
+    [State(Ids.LOGIN_USERNAME, 'value'),
+     State(Ids.LOGIN_PASSWORD, 'value')],
+    prevent_initial_call=True
+)
+def login(n_clicks, username, password):
+    if n_clicks is None:
+        raise PreventUpdate
+
+    print(f"\nAttempting login for user: {username}")
+
+    if verify_user(username, password):
+        try:
+            token = create_token(username)
+            print(f"Token created: {token}")
+
+            # Salva i dati di sessione
+            session_data = save_session_data(username, token)
+            print(f"Session data saved: {session_data}")
+
+            # Verifica che i dati siano stati salvati
+            current_session = check_session()
+            print(f"Current session after save: {current_session}")
+
+            return session_data, '', '/'
+
+        except Exception as e:
+            print(f"Error in login process: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, dbc.Alert(f"Errore durante il login: {str(e)}", color="danger"), no_update
+
+    return None, dbc.Alert("Credenziali non valide", color="danger"), '/login'
+
+
+@app.callback(
+    [Output(Ids.REGISTER_ERROR, 'children'),
+     Output(Ids.REGISTER_SUCCESS, 'children'),
+     Output('url', 'pathname', allow_duplicate=True)],
+    [Input(Ids.REGISTER_BUTTON, 'n_clicks')],
+    [State(Ids.REGISTER_USERNAME, 'value'),
+     State(Ids.REGISTER_PASSWORD, 'value'),
+     State(Ids.REGISTER_CONFIRM, 'value')],
+    prevent_initial_call=True
+)
+def register(n_clicks, username, password, password_confirm):
+    if n_clicks is None:
+        raise PreventUpdate
+
+    if password != password_confirm:
+        return dbc.Alert("Le password non coincidono", color="danger"), None, no_update
+
+    success, message = create_user(username, password)
+    if success:
+        return None, dbc.Alert(message, color="success"), '/login'
+    return dbc.Alert(message, color="danger"), None, no_update
+
+
+@app.callback(
+    Output('url', 'pathname', allow_duplicate=True),
+    [Input(Ids.SHOW_REGISTER_BUTTON, 'n_clicks')],
+    prevent_initial_call=True
+)
+def navigate_to_register(n_clicks):
+    if n_clicks is None:
+        raise PreventUpdate
+    return '/register'
+
+
+@app.callback(
+    Output('url', 'pathname', allow_duplicate=True),
+    [Input(Ids.SHOW_LOGIN_BUTTON, 'n_clicks')],
+    prevent_initial_call=True
+)
+def navigate_to_login(n_clicks):
+    if n_clicks is None:
+        raise PreventUpdate
+    return '/login'
+
+
+@app.callback(
+    [Output('session', 'clear_data'),
+     Output('url', 'pathname', allow_duplicate=True)],
+    [Input('logout-button', 'n_clicks')],
+    prevent_initial_call=True
+)
+def logout(n_clicks):
+    if n_clicks is None:
+        raise PreventUpdate
+
+    print("Performing logout")  # Debug print
+    try:
+        # Pulisci eventuali dati di sessione Flask
+        if flask.has_request_context():
+            flask.session.clear()
+    except Exception as e:
+        print(f"Error clearing Flask session: {e}")
+
+    return True, '/login'
+
+
+@app.server.before_request
+def before_request_func():
+    # print("\n=== Request Info ===")
+    # print(f"Path: {flask.request.path}")
+    # print(f"Cookies: {flask.request.cookies}")
+    if flask.has_request_context():
+        session_data = flask.request.cookies.get('session')
+    #    if session_data:
+    #        print(f"Session Data: {session_data}")
+    # print("==================\n")
+
+
 @app.callback(
     Output("save-config-message", "children"),
     [Input("save-config-button", "n_clicks")],
@@ -2191,11 +2660,18 @@ def create_extra_info_component(prediction, varieties_info):
      State("cost-marketing", "value"),
      State("cost-commerciali", "value"),
      State("price-olio", "value"),
-     State("perc-vendita-diretta", "value")]
+     State("perc-vendita-diretta", "value"),
+     # Debug mode
+     State(Ids.DEBUG_SWITCH, "value")],
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ]
 )
 def save_configuration(n_clicks, hectares, var1, tech1, perc1, var2, tech2, perc2,
                        var3, tech3, perc3, amm, ass, man, cert, rac, pot, fer, irr,
-                       mol, sto, bot, eti, mark, comm, price, perc_dir):
+                       mol, sto, bot, eti, mark, comm, price, perc_dir, debug_mode):
     if n_clicks is None:
         return no_update
 
@@ -2236,10 +2712,15 @@ def save_configuration(n_clicks, hectares, var1, tech1, perc1, var2, tech2, perc
                 'prezzo_vendita': price,
                 'perc_vendita_diretta': perc_dir
             }
+        },
+        'inference': {
+            'debug_mode': debug_mode,
+            'model_path': './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
         }
     }
 
-    if save_config(config):
+    success, message = save_config(config)
+    if success:
         return dbc.Alert(
             "Configurazione salvata con successo!",
             color="success",
@@ -2248,35 +2729,11 @@ def save_configuration(n_clicks, hectares, var1, tech1, perc1, var2, tech2, perc
         )
     else:
         return dbc.Alert(
-            "Errore nel salvataggio della configurazione",
+            f"Errore nel salvataggio della configurazione: {message}",
             color="danger",
             duration=4000,
             is_open=True
         )
-
-
-# Aggiorna la configurazione dei grafici per essere più responsive
-def create_figure_layout(fig, title):
-    fig.update_layout(
-        title=title,
-        title_x=0.5,
-        margin=dict(l=20, r=20, t=40, b=20),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        height=350,
-        font=dict(family="Helvetica, Arial, sans-serif"),
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        )
-    )
-    return fig
-
-
 
 
 @app.callback(
@@ -2285,6 +2742,11 @@ def create_figure_layout(fig, title):
         Input("percentage-1-input", "value"),
         Input("percentage-2-input", "value"),
         Input("percentage-3-input", "value")
+    ],
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
     ]
 )
 def check_percentages(perc1, perc2, perc3):
@@ -2298,11 +2760,18 @@ def check_percentages(perc1, perc2, perc3):
                 color="danger",
                 className="mt-2"
             )
+        if total < 100:
+            return dbc.Alert(
+                f"La somma delle percentuali è {total}% (non può essere inferiore a 100%)",
+                color="danger",
+                className="mt-2"
+            )
         return ""
 
     except Exception as e:
         print(f"Errore nel controllo delle percentuali: {str(e)}")
         return ""
+
 
 @app.callback(
     [
@@ -2348,6 +2817,11 @@ def check_percentages(perc1, perc2, perc3):
         Input("variety-2-dropdown", "value"),
         Input("variety-3-dropdown", "value"),
         Input('_pages_location', 'pathname')
+    ],
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
     ]
 )
 def load_configuration(active_tab, variety2, variety3, pathname):
@@ -2415,162 +2889,38 @@ def load_configuration(active_tab, variety2, variety3, pathname):
         return [no_update] * 31
 
 
-def create_production_details_figure(prediction):
-    """Crea il grafico dei dettagli produzione con il nuovo stile"""
-    details_data = prepare_details_data(prediction)
-    fig = px.bar(
-        details_data,
-        x='Varietà',
-        y='Produzione',
-        color='Tipo',
-        barmode='group',
-        color_discrete_map={'Olive': '#2185d0', 'Olio': '#21ba45'}
-    )
-    return create_figure_layout(fig, 'Dettagli Produzione per Varietà')
-
-
-def create_weather_impact_figure(weather_data):
-    """Crea il grafico dell'impatto meteorologico con il nuovo stile"""
-    recent_weather = weather_data.tail(41).copy()
-    fig = px.scatter(
-        recent_weather,
-        x='temp',
-        y='solarradiation',
-        size='precip',
-        color_discrete_sequence=['#2185d0']
-    )
-    return create_figure_layout(fig, 'Condizioni Meteorologiche')
-
-
-def create_water_needs_figure(prediction):
-    """Crea il grafico del fabbisogno idrico con il nuovo stile"""
-    # Definisci i mesi in italiano
-    months = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
-              'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
-
-    water_data = []
-    for detail in prediction['variety_details']:
-        for month in months:
-            season = get_season_from_month(month)
-            variety_info = olive_varieties[
-                olive_varieties['Varietà di Olive'] == detail['variety']
-                ].iloc[0]
-
-            water_need = variety_info[f'Fabbisogno Acqua {season} (m³/ettaro)']
-            water_data.append({
-                'Month': month,
-                'Variety': detail['variety'],
-                'Water_Need': water_need * (detail['percentage'] / 100)
-            })
-
-    water_df = pd.DataFrame(water_data)
-    fig = px.bar(
-        water_df,
-        x='Month',
-        y='Water_Need',
-        color='Variety',
-        barmode='stack',
-        color_discrete_sequence=['#2185d0', '#21ba45', '#6435c9']
-    )
-
-    return create_figure_layout(fig, 'Fabbisogno Idrico Mensile')
-
-
-def get_season_from_month(month):
-    """Helper function per determinare la stagione dal mese."""
-    seasons = {
-        'Gen': 'Inverno',
-        'Feb': 'Inverno',
-        'Mar': 'Primavera',
-        'Apr': 'Primavera',
-        'Mag': 'Primavera',
-        'Giu': 'Estate',
-        'Lug': 'Estate',
-        'Ago': 'Estate',
-        'Set': 'Autunno',
-        'Ott': 'Autunno',
-        'Nov': 'Autunno',
-        'Dic': 'Inverno'
-    }
-    return seasons[month]
-
-
-def prepare_details_data(prediction):
-    """Prepara i dati per il grafico dei dettagli di produzione"""
-    details_data = []
-
-    # Dati per ogni varietà
-    for detail in prediction['variety_details']:
-        details_data.extend([
-            {
-                'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
-                'Tipo': 'Olive',
-                'Produzione': detail['production_per_ha']
-            },
-            {
-                'Varietà': f"{detail['variety']} ({detail['percentage']}%)",
-                'Tipo': 'Olio',
-                'Produzione': detail['oil_per_ha']
-            }
-        ])
-
-    # Aggiungi totali
-    details_data.extend([
-        {
-            'Varietà': 'Totale',
-            'Tipo': 'Olive',
-            'Produzione': prediction['olive_production']
-        },
-        {
-            'Varietà': 'Totale',
-            'Tipo': 'Olio',
-            'Produzione': prediction['avg_oil_production']
-        }
-    ])
-
-    return pd.DataFrame(details_data)
-
-
-def get_season_from_month(month):
-    """Helper function per determinare la stagione dal mese."""
-    seasons = {
-        'Gen': 'Inverno', 'Feb': 'Inverno', 'Mar': 'Primavera',
-        'Apr': 'Primavera', 'Mag': 'Primavera', 'Giu': 'Estate',
-        'Lug': 'Estate', 'Ago': 'Estate', 'Set': 'Autunno',
-        'Ott': 'Autunno', 'Nov': 'Autunno', 'Dic': 'Inverno'
-    }
-    return seasons[month]
-
-
 @app.callback(
     [
-        Output('growth-simulation-chart', 'figure'),
-        Output('production-simulation-chart', 'figure'),
-        Output('simulation-summary', 'children'),
-        Output('kpi-container', 'children', allow_duplicate=True),
-        Output('olive-production_ha', 'children'),
-        Output('oil-production_ha', 'children'),
-        Output('water-need_ha', 'children'),
-        Output('olive-production', 'children'),
-        Output('oil-production', 'children'),
-        Output('water-need', 'children'),
-        Output('production-details', 'figure'),
-        Output('weather-impact', 'figure'),
-        Output('water-needs', 'figure'),
-        Output('extra-info', 'children')
+        Output(Ids.GROWTH_CHART, 'figure'),
+        Output(Ids.PRODUCTION_CHART, 'figure'),
+        Output(Ids.SIMULATION_SUMMARY, 'children'),
+        Output(Ids.KPI_CONTAINER, 'children', allow_duplicate=True),
+        Output(Ids.OLIVE_PRODUCTION_HA, 'children'),
+        Output(Ids.OIL_PRODUCTION_HA, 'children'),
+        Output(Ids.WATER_NEED_HA, 'children'),
+        Output(Ids.OLIVE_PRODUCTION, 'children'),
+        Output(Ids.OIL_PRODUCTION, 'children'),
+        Output(Ids.WATER_NEED, 'children'),
+        Output(Ids.PRODUCTION_DETAILS, 'figure'),
+        Output(Ids.WEATHER_IMPACT, 'figure'),
+        Output(Ids.WATER_NEEDS, 'figure'),
+        Output(Ids.EXTRA_INFO, 'children'),
+        Output(Ids.INFERENCE_REQUESTS, 'children')
     ],
-    [
-        Input('simulate-btn', 'n_clicks')
-    ],
-    [
-        State('temp-slider', 'value'),
-        State('humidity-slider', 'value'),
-        State('rainfall-input', 'value'),
-        State('radiation-input', 'value')
-    ],
-    prevent_initial_call='initial_duplicate'
+    [Input(Ids.SIMULATE_BUTTON, 'n_clicks')],
+    [State(Ids.TEMP_SLIDER, 'value'),
+     State(Ids.HUMIDITY_SLIDER, 'value'),
+     State(Ids.RAINFALL_INPUT, 'value'),
+     State(Ids.RADIATION_INPUT, 'value'),
+     State(Ids.INFERENCE_COUNTER, 'data')],
+    prevent_initial_call='initial_duplicate',
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ]
 )
-def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
+def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation, counter_data):
     """
     Callback principale per aggiornare tutti i componenti della simulazione
     """
@@ -2580,7 +2930,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
         empty_production_fig = go.Figure()
         empty_summary = html.Div()
         empty_kpis = html.Div()
-        return empty_growth_fig, empty_production_fig, empty_summary, empty_kpis, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, ""
+        return empty_growth_fig, empty_production_fig, empty_summary, empty_kpis, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, "", 0
 
     try:
         # Inizializza il simulatore
@@ -2638,7 +2988,11 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
                     varieties_info.append(variety_data.iloc[0])
                     percentages.append(variety_config['percentage'])
 
+            current_count = counter_data.get('count', 0) + 1
+
             prediction = make_prediction(weather_data, varieties_info, percentages, hectares, sim_data)
+
+            dcc.Store(id=Ids.INFERENCE_COUNTER, data={'count': current_count})
 
             # Formattazione output con valori per ettaro e totali
             olive_prod_text_ha = f"{prediction['olive_production']:.0f} kg/ha\n"
@@ -2662,11 +3016,11 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
                 growth_fig, production_fig, summary, kpi_indicators,
                 olive_prod_text_ha, oil_prod_text_ha, water_need_text_ha,
                 olive_prod_text, oil_prod_text, water_need_text,
-                details_fig, weather_fig, water_fig, extra_info)
+                details_fig, weather_fig, water_fig, extra_info, f"{current_count}")
 
         except Exception as e:
             print(f"Errore nell'aggiornamento dashboard: {str(e)}")
-            return growth_fig, production_fig, summary, kpi_indicators, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, ""
+            return growth_fig, production_fig, summary, kpi_indicators, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, "", 0
 
     except Exception as e:
         print(f"Errore nella simulazione: {str(e)}")
@@ -2678,16 +3032,20 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation):
             color="danger"
         )
         empty_kpis = html.Div()
-        return empty_growth_fig, empty_production_fig, error_summary, empty_kpis, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, ""
+        return empty_growth_fig, empty_production_fig, error_summary, empty_kpis, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", {}, {}, {}, "", 0
 
 
-# Aggiungiamo un callback per gestire l'abilitazione del pulsante di simulazione
 @app.callback(
-    Output('simulate-btn', 'disabled'),
-    [Input('temp-slider', 'value'),
-     Input('humidity-slider', 'value'),
-     Input('rainfall-input', 'value'),
-     Input('radiation-input', 'value')]
+    Output(Ids.SIMULATE_BUTTON, 'disabled'),
+    [Input(Ids.TEMP_SLIDER, 'value'),
+     Input(Ids.HUMIDITY_SLIDER, 'value'),
+     Input(Ids.RAINFALL_INPUT, 'value'),
+     Input(Ids.RADIATION_INPUT, 'value')],
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ]
 )
 def update_button_state(temp_range, humidity, rainfall, radiation):
     """
@@ -2699,77 +3057,108 @@ def update_button_state(temp_range, humidity, rainfall, radiation):
     # Verifica range validi
     if not (0 <= humidity <= 100):
         return True
-    if not (0 <= rainfall <= 500):
+    if not (0 <= rainfall <= 1000):
         return True
-    if not (0 <= radiation <= 1000):
+    if not (0 <= radiation <= 1200):
         return True
 
     return False
 
 
-# Callback per aggiornare il layout dei grafici in base alle dimensioni della finestra
-'''@app.clientside_callback(
-    """
-    function(value) {
-        return {
-            'height': window.innerHeight * 0.6
-        }
-    }
-    """,
-    Output('growth-simulation-chart', 'style'),
-    Input('growth-simulation-chart', 'id')
-)
-'''
-
-
 @app.callback(
-    Output('kpi-container', 'children', allow_duplicate=True),
-    [Input('growth-simulation-chart', 'figure'),
-     Input('production-simulation-chart', 'figure')],
-    [State('temp-slider', 'value'),
-     State('humidity-slider', 'value'),
-     State('rainfall-input', 'value'),
-     State('radiation-input', 'value')],
-    prevent_initial_callbacks='initial_duplicate'
+    Output(Ids.KPI_CONTAINER, 'children', allow_duplicate=True),
+    [Input(Ids.GROWTH_CHART, 'figure'),
+     Input(Ids.PRODUCTION_CHART, 'figure')],
+    [State(Ids.TEMP_SLIDER, 'value'),
+     State(Ids.HUMIDITY_SLIDER, 'value'),
+     State(Ids.RAINFALL_INPUT, 'value'),
+     State(Ids.RADIATION_INPUT, 'value')],
+    prevent_initial_callbacks='initial_duplicate',
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ]
 )
 def update_kpis(growth_fig, prod_fig, temp_range, humidity, rainfall, radiation):
     """Aggiorna i KPI quando cambia la simulazione"""
 
-    # Ricalcola la simulazione
     simulator = EnvironmentalSimulator()
     sim_data = simulator.simulate_growth(temp_range, humidity, rainfall, radiation)
 
-    # Calcola i KPI
     kpis = calculate_kpis(sim_data)
 
-    # Crea gli indicatori
     return create_kpi_indicators(kpis)
 
 
 @app.callback(
     Output('growth-simulation-chart', 'style'),
-    Input('growth-simulation-chart', 'id')
+    Input('growth-simulation-chart', 'id'),
+    running=[
+        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
+         [Input('url', 'pathname')],
+         lambda x: x == '/')
+    ]
 )
 def update_graph_style(graph_id):
     return {
         'height': '60vh',  # Altezza responsive
-        'min-height': '400px',
-        'max-height': '800px'
+        'minHeight': '400px',
+        'maxHeight': '800px'
     }
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('DASH_PORT', 8888))
-    debug = int(os.environ.get('DASH_DEBUG', False))
+@app.callback(
+    Output(Ids.INFERENCE_COUNTER, 'data'),
+    [Input(Ids.SIMULATE_BUTTON, 'n_clicks')],
+    [State(Ids.INFERENCE_COUNTER, 'data')],
+    prevent_initial_call=True
+)
+def update_inference_counter(n_clicks, current_data):
+    if n_clicks is None:
+        raise PreventUpdate
 
-    # Oppure usando argparse per gli argomenti da riga di comando
+    try:
+        current_count = current_data.get('count', 0) + 1
+        return {'count': current_count}
+    except Exception as e:
+        print(f"Errore nell'aggiornamento del contatore: {str(e)}")
+        return current_data
+
+
+@app.callback(
+    [
+        Output(Ids.INFERENCE_REQUESTS, 'children', allow_duplicate=True),
+        Output(Ids.PRODUCTION_INFERENCE_REQUESTS, 'children', allow_duplicate=True)
+    ],
+    [Input(Ids.INFERENCE_COUNTER, 'data')],
+    prevent_initial_call=True
+)
+def display_inference_count(counter_data):
+    try:
+        count = counter_data.get('count', 0)
+        return f"{count}", f"{count}"
+    except Exception as e:
+        print(f"Errore nella visualizzazione del contatore: {str(e)}")
+        return "0", "0"
+
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=8888, help='Port to run the server on')
-    parser.add_argument('--debug', type=bool, default=False, help='Debug')
+    parser.add_argument('--port', type=int, help='Port to run the server on')
+    parser.add_argument('--debug', action='store_true', help='Debug mode')
     args = parser.parse_args()
+
+    env_port = int(os.environ.get('DASH_PORT', 8888))
+    env_debug = os.environ.get('DASH_DEBUG', '').lower() == 'true'
+
+    port = args.port if args.port is not None else env_port
+    debug = args.debug if args.debug else env_debug
+
+    print(f"Starting server on port {port} with debug={'on' if debug else 'off'}")
 
     app.run_server(
         host='0.0.0.0',
-        port=args.port,
+        port=port,
         debug=debug
     )

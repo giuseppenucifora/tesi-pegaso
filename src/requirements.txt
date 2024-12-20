@@ -19,3 +19,6 @@ psutil>=5.9.0
 
 # File handling
 dvc>=2.0.0  # Per la gestione dei file sources.dvc
+
+# Auth
+PyJWT==2.7.0

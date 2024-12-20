@@ -1,6 +1,6 @@
 {
     "oliveto": {
-        "hectares": 4.35,
+        "hectares": 1,
         "varieties": [
             {
                 "variety": "Nocellara dell'Etna",
@@ -10,12 +10,12 @@
             {
                 "variety": "Frantoio",
                 "technique": "tradizionale",
-                "percentage": 10
+                "percentage": 20
             },
             {
                 "variety": "Coratina",
                 "technique": "tradizionale",
-                "percentage": 40
+                "percentage": 30
             }
         ]
     },
@@ -46,6 +46,7 @@
         }
     },
     "inference": {
-        "debug_mode": false
+        "debug_mode": false,
+        "model_path": "./sources/olive_oil_transformer/olive_oil_transformer_model.keras"
     }
 }

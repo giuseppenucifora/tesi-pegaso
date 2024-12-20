@@ -133,22 +133,24 @@ def simulate_zone(base_weather, olive_varieties, year, zone, all_varieties, vari
                                   variety_info['Fabbisogno Acqua Estate (m³/ettaro)'] +
                                   variety_info['Fabbisogno Acqua Autunno (m³/ettaro)'] +
                                   variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']
-                          ) / 4
+                          ) / 12
 
         monthly_water_need = zone_weather.apply(
             lambda row: calculate_water_need(row, base_water_need, variety_info['Temperatura Ottimale']),
             axis=1
         )
+        #print(f'Monthly - {variety} - hectares {hectares} - {monthly_water_need}')
         monthly_water_need *= np.random.uniform(0.95, 1.05, len(monthly_water_need))
+        #print(f'Monthly 2 - {variety} - hectares {hectares} - {monthly_water_need}')
         annual_variety_water_need = monthly_water_need.sum() * percentage * hectares
-
+        #print(f'Annual Variety - {variety} - hectares {hectares} - {annual_variety_water_need}')
         # Aggiorna totali annuali
         annual_production += annual_variety_production
         annual_min_oil += min_oil_production
         annual_max_oil += max_oil_production
         annual_avg_oil += avg_oil_production
         annual_water_need += annual_variety_water_need
-
+        #print(f'Total Annual {annual_water_need}')
         # Aggiorna dati varietà
         clean_variety = clean_column_name(variety)
         variety_data[clean_variety].update({
@@ -240,9 +242,9 @@ def simulate_olive_production_parallel(weather_data, olive_varieties, num_simula
         print(f"Utilizzando {max_workers} workers ottimali basati sulle risorse del sistema")
 
     # Calcolo numero di batch
-    num_batches = (num_simulations + batch_size - 1) // batch_size
+    num_batches = (num_simulations * num_zones - 1) // batch_size
     print(f"Elaborazione di {num_simulations} simulazioni con {num_zones} zone in {num_batches} batch")
-    print(f"Totale record attesi: {num_simulations * num_zones:,}")
+    print(f"Totale record attesi: {num_simulations * num_zones}")
 
     # Lista per contenere tutti i DataFrame dei batch
     all_batches = []
@@ -368,11 +370,11 @@ def calculate_production(variety_info, weather, percentage, hectares, seed):
                               variety_info['Fabbisogno Acqua Inverno (m³/ettaro)']
                       ) / 4 * percentage * hectares
 
-    water_need = (
-            base_water_need *
-            (1 + max(0, (weather['temp_mean'] - 20) / 50)) *
-            max(0.6, 1 - (weather['precip_sum'] / 1000))
-    )
+    temp_factor = 1 + max(0, (weather["temp_mean"] - 20) / 50)
+    rain_factor = max(0.6, 1 - (weather["precip_sum"] / 1000))
+    water_need = base_water_need * temp_factor * rain_factor
+
+    print(f'temp factor: {temp_factor} rainfall factor: {rain_factor} water_need: {water_need}')
 
     return {
         'variety': variety_info['Varietà di Olive'],
