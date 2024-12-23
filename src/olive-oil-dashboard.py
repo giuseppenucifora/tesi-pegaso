@@ -1,6 +1,8 @@
+import warnings
+
 import flask
 import plotly.express as px
-from dash import Dash, dcc, html, Input, Output, State, callback_context
+from dash import Dash, dcc, html, Input, Output, State
 import tensorflow as tf
 import keras
 import joblib
@@ -9,13 +11,14 @@ import os
 import argparse
 import json
 from dash.exceptions import PreventUpdate
+from dash_bootstrap_components import Card
 
 from auth import utils
 from utils.helpers import clean_column_name
 from dashboard.environmental_simulator import *
 from dash import no_update
 from auth.utils import (
-    init_directory_structure, verify_user, create_token,
+    verify_user, create_token,
     verify_token, create_user, get_user_config_path, get_default_config
 )
 from auth.login import create_login_layout, create_register_layout
@@ -26,13 +29,6 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # Set global precision policy
 tf.keras.mixed_precision.set_global_policy('float32')
-
-DEV_MODE = True
-model = None
-scaler_temporal = None
-scaler_static = None
-scaler_y = None
-MODEL_LOADING = False
 
 
 def load_config():
@@ -104,20 +100,6 @@ def save_config(config):
         import traceback
         traceback.print_exc()
         return False, f"Errore nel salvataggio: {str(e)}"
-
-
-try:
-    print(f"Caricamento dataset e scaler...")
-
-    simulated_data = pd.read_parquet("./sources/olive_training_dataset.parquet")
-    weather_data = pd.read_parquet("./sources/weather_data_solarenergy.parquet")
-    olive_varieties = pd.read_parquet("./sources/olive_varieties.parquet")
-    scaler_temporal = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_temporal.joblib')
-    scaler_static = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_static.joblib')
-    scaler_y = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_y.joblib')
-except Exception as e:
-    print(f"Errore nel caricamento: {str(e)}")
-    raise e
 
 
 def prepare_static_features_multiple(varieties_info, percentages, hectares, all_varieties):
@@ -348,233 +330,216 @@ def mock_make_prediction(weather_data, varieties_info, percentages, hectares, si
 
 
 def make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data=None):
-    print(f"DEV_MODE: {DEV_MODE}")
-    if DEV_MODE:
-        return mock_make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data)
-    try:
-        if MODEL_LOADING:
-            return {
-                'olive_production': 0,  # kg/ha
-                'olive_production_total': 0 * hectares,  # kg totali
-                'min_oil_production': 0,  # L/ha
-                'max_oil_production': 0,  # L/ha
-                'avg_oil_production': 0,  # L/ha
-                'avg_oil_production_total': 0 * hectares,  # L totali
-                'water_need': 0,  # m³/ha
-                'water_need_total': 0,  # m³ totali
-                'variety_details': 0,
-                'hectares': hectares,
-                'stress_factor': 0 if simulation_data is not None else 1.0
+    if app_state.use_model:
+        try:
+            print("Inizio della funzione make_prediction")
+
+            # Prepara i dati temporali (meteorologici)
+            temporal_features = ['temp_mean', 'precip_sum', 'solar_energy_sum']
+
+            if simulation_data is not None:
+                # Usa i dati della simulazione
+                print("Usando dati dalla simulazione ambientale")
+                # Calcola le medie dai dati simulati
+                temporal_data = np.array([[
+                    simulation_data['temperature'].mean(),
+                    simulation_data['rainfall'].sum(),
+                    simulation_data['radiation'].mean()
+                ]])
+            else:
+                # Usa i dati meteorologici storici
+                monthly_stats = weather_data.groupby(['year', 'month']).agg({
+                    'temp': 'mean',
+                    'precip': 'sum',
+                    'solarradiation': 'sum'
+                }).reset_index()
+
+                monthly_stats = monthly_stats.rename(columns={
+                    'temp': 'temp_mean',
+                    'precip': 'precip_sum',
+                    'solarradiation': 'solar_energy_sum'
+                })
+
+                # Prendi gli ultimi dati meteorologici
+                temporal_data = monthly_stats[temporal_features].tail(1).values
+
+            # Calcola il fattore di stress dalla simulazione
+            stress_factor = 1.0
+            if simulation_data is not None:
+                avg_stress = simulation_data['stress_index'].mean()
+                # Applica una penalità basata sullo stress
+                stress_factor = 1.0 - (avg_stress * 0.5)  # Riduce fino al 50% basato sullo stress
+                print(f"Fattore di stress dalla simulazione: {stress_factor:.2f}")
+
+            # Prepara i dati statici
+            static_data = []
+
+            # Aggiungi hectares come prima feature statica
+            static_data.append(hectares)
+
+            # Ottieni tutte le possibili varietà dal dataset di training
+            all_varieties = app_state.olive_varieties['Varietà di Olive'].unique()
+            varieties = [clean_column_name(variety) for variety in all_varieties]
+
+            # Per ogni varietà possibile nel dataset
+            for variety in varieties:
+                # Trova se questa varietà è tra quelle selezionate
+                selected_variety = None
+                selected_idx = None
+
+                for idx, info in enumerate(varieties_info):
+                    if clean_column_name(info['Varietà di Olive']) == variety:
+                        selected_variety = info
+                        selected_idx = idx
+                        break
+
+                if selected_variety is not None:
+                    percentage = percentages[selected_idx] / 100  # Converti in decimale
+
+                    # Aggiungi tutte le feature numeriche della varietà
+                    static_data.extend([
+                        percentage,  # pct
+                        float(selected_variety['Produzione (tonnellate/ettaro)']),  # prod_t_ha
+                        float(selected_variety['Produzione Olio (tonnellate/ettaro)']),  # oil_prod_t_ha
+                        float(selected_variety['Produzione Olio (litri/ettaro)']),  # oil_prod_l_ha
+                        float(selected_variety['Min % Resa']),  # min_yield_pct
+                        float(selected_variety['Max % Resa']),  # max_yield_pct
+                        float(selected_variety['Min Produzione Olio (litri/ettaro)']),  # min_oil_prod_l_ha
+                        float(selected_variety['Max Produzione Olio (litri/ettaro)']),  # max_oil_prod_l_ha
+                        float(selected_variety['Media Produzione Olio (litri/ettaro)']),  # avg_oil_prod_l_ha
+                        float(selected_variety['Litri per Tonnellata']),  # l_per_t
+                        float(selected_variety['Min Litri per Tonnellata']),  # min_l_per_t
+                        float(selected_variety['Max Litri per Tonnellata']),  # max_l_per_t
+                        float(selected_variety['Media Litri per Tonnellata'])  # avg_l_per_t
+                    ])
+
+                    # Aggiungi le feature binarie per la tecnica
+                    tech = str(selected_variety['Tecnica di Coltivazione']).lower()
+                    static_data.extend([
+                        1 if tech == 'tradizionale' else 0,
+                        1 if tech == 'intensiva' else 0,
+                        1 if tech == 'superintensiva' else 0
+                    ])
+                else:
+                    # Se la varietà non è selezionata, aggiungi zeri per tutte le sue feature
+                    static_data.extend([0] * 13)  # Feature numeriche
+                    static_data.extend([0] * 3)  # Feature tecniche binarie
+
+            # Converti in array numpy e reshape
+            temporal_data = np.array(temporal_data).reshape(1, 1, -1)  # (1, 1, n_temporal_features)
+            static_data = np.array(static_data).reshape(1, -1)  # (1, n_static_features)
+
+            print(f"Shape dei dati temporali: {temporal_data.shape}")
+            print(f"Shape dei dati statici: {static_data.shape}")
+
+            # Standardizza i dati
+            temporal_data = app_state.scaler_temporal.transform(temporal_data.reshape(1, -1)).reshape(1, 1, -1)
+            static_data = app_state.scaler_static.transform(static_data)
+
+            # Prepara il dizionario di input per il modello
+            input_data = {
+                'temporal': temporal_data,
+                'static': static_data
             }
 
-        print("Inizio della funzione make_prediction")
+            # Effettua la predizione
+            prediction = app_state.model.predict(input_data)
 
-        # Prepara i dati temporali (meteorologici)
-        temporal_features = ['temp_mean', 'precip_sum', 'solar_energy_sum']
+            print("\nRaw prediction:", prediction)
 
-        if simulation_data is not None:
-            # Usa i dati della simulazione
-            print("Usando dati dalla simulazione ambientale")
-            # Calcola le medie dai dati simulati
-            temporal_data = np.array([[
-                simulation_data['temperature'].mean(),
-                simulation_data['rainfall'].sum(),
-                simulation_data['radiation'].mean()
-            ]])
-        else:
-            # Usa i dati meteorologici storici
-            monthly_stats = weather_data.groupby(['year', 'month']).agg({
-                'temp': 'mean',
-                'precip': 'sum',
-                'solarradiation': 'sum'
-            }).reset_index()
+            target_features = [
+                'olive_prod',  # Produzione olive kg/ha
+                'min_oil_prod',  # Produzione minima olio L/ha
+                'max_oil_prod',  # Produzione massima olio L/ha
+                'avg_oil_prod',  # Produzione media olio L/ha
+                'total_water_need'  # Fabbisogno idrico totale m³/ha
+            ]
 
-            monthly_stats = monthly_stats.rename(columns={
-                'temp': 'temp_mean',
-                'precip': 'precip_sum',
-                'solarradiation': 'solar_energy_sum'
-            })
+            prediction = app_state.scaler_y.inverse_transform(prediction)[0]
+            print("\nInverse transformed prediction:")
+            for feature, value in zip(target_features, prediction):
+                print(f"{feature}: {value:.2f}")
 
-            # Prendi gli ultimi dati meteorologici
-            temporal_data = monthly_stats[temporal_features].tail(1).values
-
-        # Calcola il fattore di stress dalla simulazione
-        stress_factor = 1.0
-        if simulation_data is not None:
-            avg_stress = simulation_data['stress_index'].mean()
-            # Applica una penalità basata sullo stress
-            stress_factor = 1.0 - (avg_stress * 0.5)  # Riduce fino al 50% basato sullo stress
-            print(f"Fattore di stress dalla simulazione: {stress_factor:.2f}")
-
-        # Prepara i dati statici
-        static_data = []
-
-        # Aggiungi hectares come prima feature statica
-        static_data.append(hectares)
-
-        # Ottieni tutte le possibili varietà dal dataset di training
-        all_varieties = olive_varieties['Varietà di Olive'].unique()
-        varieties = [clean_column_name(variety) for variety in all_varieties]
-
-        # Per ogni varietà possibile nel dataset
-        for variety in varieties:
-            # Trova se questa varietà è tra quelle selezionate
-            selected_variety = None
-            selected_idx = None
-
-            for idx, info in enumerate(varieties_info):
-                if clean_column_name(info['Varietà di Olive']) == variety:
-                    selected_variety = info
-                    selected_idx = idx
-                    break
-
-            if selected_variety is not None:
-                percentage = percentages[selected_idx] / 100  # Converti in decimale
-
-                # Aggiungi tutte le feature numeriche della varietà
-                static_data.extend([
-                    percentage,  # pct
-                    float(selected_variety['Produzione (tonnellate/ettaro)']),  # prod_t_ha
-                    float(selected_variety['Produzione Olio (tonnellate/ettaro)']),  # oil_prod_t_ha
-                    float(selected_variety['Produzione Olio (litri/ettaro)']),  # oil_prod_l_ha
-                    float(selected_variety['Min % Resa']),  # min_yield_pct
-                    float(selected_variety['Max % Resa']),  # max_yield_pct
-                    float(selected_variety['Min Produzione Olio (litri/ettaro)']),  # min_oil_prod_l_ha
-                    float(selected_variety['Max Produzione Olio (litri/ettaro)']),  # max_oil_prod_l_ha
-                    float(selected_variety['Media Produzione Olio (litri/ettaro)']),  # avg_oil_prod_l_ha
-                    float(selected_variety['Litri per Tonnellata']),  # l_per_t
-                    float(selected_variety['Min Litri per Tonnellata']),  # min_l_per_t
-                    float(selected_variety['Max Litri per Tonnellata']),  # max_l_per_t
-                    float(selected_variety['Media Litri per Tonnellata'])  # avg_l_per_t
-                ])
-
-                # Aggiungi le feature binarie per la tecnica
-                tech = str(selected_variety['Tecnica di Coltivazione']).lower()
-                static_data.extend([
-                    1 if tech == 'tradizionale' else 0,
-                    1 if tech == 'intensiva' else 0,
-                    1 if tech == 'superintensiva' else 0
-                ])
-            else:
-                # Se la varietà non è selezionata, aggiungi zeri per tutte le sue feature
-                static_data.extend([0] * 13)  # Feature numeriche
-                static_data.extend([0] * 3)  # Feature tecniche binarie
-
-        # Converti in array numpy e reshape
-        temporal_data = np.array(temporal_data).reshape(1, 1, -1)  # (1, 1, n_temporal_features)
-        static_data = np.array(static_data).reshape(1, -1)  # (1, n_static_features)
-
-        print(f"Shape dei dati temporali: {temporal_data.shape}")
-        print(f"Shape dei dati statici: {static_data.shape}")
-
-        # Standardizza i dati
-        temporal_data = scaler_temporal.transform(temporal_data.reshape(1, -1)).reshape(1, 1, -1)
-        static_data = scaler_static.transform(static_data)
-
-        # Prepara il dizionario di input per il modello
-        input_data = {
-            'temporal': temporal_data,
-            'static': static_data
-        }
-
-        # Effettua la predizione
-        prediction = model.predict(input_data)
-
-        print("\nRaw prediction:", prediction)
-
-        target_features = [
-            'olive_prod',  # Produzione olive kg/ha
-            'min_oil_prod',  # Produzione minima olio L/ha
-            'max_oil_prod',  # Produzione massima olio L/ha
-            'avg_oil_prod',  # Produzione media olio L/ha
-            'total_water_need'  # Fabbisogno idrico totale m³/ha
-        ]
-
-        prediction = scaler_y.inverse_transform(prediction)[0]
-        print("\nInverse transformed prediction:")
-        for feature, value in zip(target_features, prediction):
-            print(f"{feature}: {value:.2f}")
-
-        # Applica il fattore di stress se disponibile
-        if simulation_data is not None:
-            prediction = prediction * stress_factor
-            print(f"Applied stress factor: {stress_factor}")
-            print(f"Prediction after stress:", prediction)
-
-        prediction[4] = prediction[4] / 4  # correggo il bias creato dai dati di simulazione errati @todo nel prossimo modello addestrato con i dati corretti sarà dovrà essere rimosso
-
-        # Calcola i valori per ettaro dividendo per il numero di ettari
-        olive_prod_ha = prediction[0] / hectares
-        min_oil_prod_ha = prediction[1] / hectares
-        max_oil_prod_ha = prediction[2] / hectares
-        avg_oil_prod_ha = prediction[3] / hectares
-        water_need_ha = prediction[4] / hectares
-
-        print("\nValori per ettaro:")
-        print(f"Olive production per ha: {olive_prod_ha:.2f} kg/ha")
-        print(f"Min oil production per ha: {min_oil_prod_ha:.2f} L/ha")
-        print(f"Max oil production per ha: {max_oil_prod_ha:.2f} L/ha")
-        print(f"Avg oil production per ha: {avg_oil_prod_ha:.2f} L/ha")
-        print(f"Water need per ha: {water_need_ha:.2f} m³/ha")
-
-        # Calcola i dettagli per varietà
-        variety_details = []
-        total_water_need = prediction[4]  # Usa il valore predetto totale
-
-        for variety_info, percentage in zip(varieties_info, percentages):
-            # Calcoli specifici per varietà
-            base_prod_per_ha = float(variety_info['Produzione (tonnellate/ettaro)']) * 1000 * (percentage / 100)
-            prod_per_ha = base_prod_per_ha
+            # Applica il fattore di stress se disponibile
             if simulation_data is not None:
-                prod_per_ha *= stress_factor
-            prod_total = prod_per_ha * hectares
+                prediction = prediction * stress_factor
+                print(f"Applied stress factor: {stress_factor}")
+                print(f"Prediction after stress:", prediction)
 
-            base_oil_per_ha = float(variety_info['Produzione Olio (litri/ettaro)']) * (percentage / 100)
-            oil_per_ha = base_oil_per_ha
-            if simulation_data is not None:
-                oil_per_ha *= stress_factor
-            oil_total = oil_per_ha * hectares
+            # Calcola i valori per ettaro dividendo per il numero di ettari
+            olive_prod_ha = prediction[0] / hectares
+            min_oil_prod_ha = prediction[1] / hectares
+            max_oil_prod_ha = prediction[2] / hectares
+            avg_oil_prod_ha = prediction[3] / hectares
+            water_need_ha = prediction[4] / hectares
 
-            print(f"\nVariety: {variety_info['Varietà di Olive']}")
-            print(f"Base production: {base_prod_per_ha:.2f} kg/ha")
-            print(f"Final production: {prod_per_ha:.2f} kg/ha")
-            print(f"Base oil: {base_oil_per_ha:.2f} L/ha")
-            print(f"Final oil: {oil_per_ha:.2f} L/ha")
+            print("\nValori per ettaro:")
+            print(f"Olive production per ha: {olive_prod_ha:.2f} kg/ha")
+            print(f"Min oil production per ha: {min_oil_prod_ha:.2f} L/ha")
+            print(f"Max oil production per ha: {max_oil_prod_ha:.2f} L/ha")
+            print(f"Avg oil production per ha: {avg_oil_prod_ha:.2f} L/ha")
+            print(f"Water need per ha: {water_need_ha:.2f} m³/ha")
 
-            variety_details.append({
-                'variety': variety_info['Varietà di Olive'],
-                'percentage': percentage,
-                'production_per_ha': prod_per_ha,
-                'production_total': prod_total,
-                'oil_per_ha': oil_per_ha,
-                'oil_total': oil_total,
-                'water_need': water_need_ha * (percentage / 100),  # Distribuisci il fabbisogno idrico in base alla percentuale
-                'base_production': base_prod_per_ha,  # Produzione senza stress
-                'base_oil': base_oil_per_ha,  # Produzione olio senza stress
+            # Calcola i dettagli per varietà
+            variety_details = []
+            total_water_need = prediction[4]  # Usa il valore predetto totale
+
+            for variety_info, percentage in zip(varieties_info, percentages):
+                # Calcoli specifici per varietà
+                base_prod_per_ha = float(variety_info['Produzione (tonnellate/ettaro)']) * 1000 * (percentage / 100)
+                prod_per_ha = base_prod_per_ha
+                if simulation_data is not None:
+                    prod_per_ha *= stress_factor
+                prod_total = prod_per_ha * hectares
+
+                base_oil_per_ha = float(variety_info['Produzione Olio (litri/ettaro)']) * (percentage / 100)
+                oil_per_ha = base_oil_per_ha
+                if simulation_data is not None:
+                    oil_per_ha *= stress_factor
+                oil_total = oil_per_ha * hectares
+
+                print(f"\nVariety: {variety_info['Varietà di Olive']}")
+                print(f"Base production: {base_prod_per_ha:.2f} kg/ha")
+                print(f"Final production: {prod_per_ha:.2f} kg/ha")
+                print(f"Base oil: {base_oil_per_ha:.2f} L/ha")
+                print(f"Final oil: {oil_per_ha:.2f} L/ha")
+
+                variety_details.append({
+                    'variety': variety_info['Varietà di Olive'],
+                    'percentage': percentage,
+                    'production_per_ha': prod_per_ha,
+                    'production_total': prod_total,
+                    'oil_per_ha': oil_per_ha,
+                    'oil_total': oil_total,
+                    'water_need': water_need_ha * (percentage / 100),  # Distribuisci il fabbisogno idrico in base alla percentuale
+                    'base_production': base_prod_per_ha,  # Produzione senza stress
+                    'base_oil': base_oil_per_ha,  # Produzione olio senza stress
+                    'stress_factor': stress_factor if simulation_data is not None else 1.0
+                })
+
+            return {
+                'olive_production': olive_prod_ha,  # kg/ha
+                'olive_production_total': prediction[0],  # kg totali
+                'min_oil_production': min_oil_prod_ha,  # L/ha
+                'max_oil_production': max_oil_prod_ha,  # L/ha
+                'avg_oil_production': avg_oil_prod_ha,  # L/ha
+                'avg_oil_production_total': prediction[3],  # L totali
+                'water_need': water_need_ha,  # m³/ha
+                'water_need_total': prediction[4],  # m³ totali
+                'variety_details': variety_details,
+                'hectares': hectares,
                 'stress_factor': stress_factor if simulation_data is not None else 1.0
-            })
+            }
 
-        return {
-            'olive_production': olive_prod_ha,  # kg/ha
-            'olive_production_total': prediction[0],  # kg totali
-            'min_oil_production': min_oil_prod_ha,  # L/ha
-            'max_oil_production': max_oil_prod_ha,  # L/ha
-            'avg_oil_production': avg_oil_prod_ha,  # L/ha
-            'avg_oil_production_total': prediction[3],  # L totali
-            'water_need': water_need_ha,  # m³/ha
-            'water_need_total': prediction[4],  # m³ totali
-            'variety_details': variety_details,
-            'hectares': hectares,
-            'stress_factor': stress_factor if simulation_data is not None else 1.0
-        }
-
-    except Exception as e:
-        print(f"Errore durante la preparazione dei dati o la predizione: {str(e)}")
-        print(f"Tipo di errore: {type(e).__name__}")
-        import traceback
-        print("Traceback completo:")
-        print(traceback.format_exc())
-        raise e
+        except Exception as e:
+            print(f"Errore durante la preparazione dei dati o la predizione: {str(e)}")
+            print(f"Tipo di errore: {type(e).__name__}")
+            import traceback
+            print("Traceback completo:")
+            print(traceback.format_exc())
+            raise e
+    else:
+        return mock_make_prediction(weather_data, varieties_info, percentages, hectares, simulation_data)
 
 
 def create_phase_card(phase: str, data: dict) -> dbc.Card:
@@ -639,7 +604,7 @@ def calculate_kpis(sim_data: pd.DataFrame) -> dict:
     return kpis
 
 
-def create_kpi_indicators(kpis: dict) -> html.Div:
+def create_kpi_indicators(kpis: dict) -> Card:
     """Crea gli indicatori visivi per i KPI"""
 
     def get_stress_color(value):
@@ -719,6 +684,213 @@ def create_kpi_indicators(kpis: dict) -> html.Div:
 
     return indicators
 
+
+class AppState:
+    _instance = None
+    _initialized = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            print("Creating new AppState instance...")
+            cls._instance = super(AppState, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        # Assicurati che l'inizializzazione avvenga solo una volta
+        if not AppState._initialized:
+            print("Inizializzazione AppState...")
+            self.simulated_data = None
+            self.weather_data = None
+            self.olive_varieties = None
+            self.scaler_temporal = None
+            self.scaler_static = None
+            self.scaler_y = None
+            self.model = None
+            self.use_model = None
+            self.initialize_app()
+            AppState._initialized = True
+
+    def initialize_app(self):
+        """Inizializza l'applicazione caricando dati e modello"""
+        try:
+            print("Inizializzazione applicazione...")
+            print("Caricamento dataset e scaler...")
+
+            # Ignora warning sulla versione di scikit-learn
+            warnings.filterwarnings("ignore", category=UserWarning)
+
+            self.simulated_data = pd.read_parquet("./sources/olive_training_dataset.parquet")
+            self.weather_data = pd.read_parquet("./sources/weather_data_solarenergy.parquet")
+            self.olive_varieties = pd.read_parquet("./sources/olive_varieties.parquet")
+            self.scaler_temporal = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_temporal.joblib')
+            self.scaler_static = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_static.joblib')
+            self.scaler_y = joblib.load('./sources/olive_oil_transformer/olive_oil_transformer_scaler_y.joblib')
+
+            print("Caricamento modello...")
+            try:
+                self.load_model()
+                print("Modello caricato con successo")
+            except Exception as e:
+                print(f"Errore nel caricamento del modello: {e}")
+                raise e
+
+            print("Inizializzazione completata con successo")
+
+        except Exception as e:
+            print(f"Errore nell'inizializzazione: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise e
+
+    def load_model(self):
+
+        try:
+            print(f"Keras version: {keras.__version__}")
+            print(f"TensorFlow version: {tf.__version__}")
+            print(f"CUDA available: {tf.test.is_built_with_cuda()}")
+            print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
+
+            # GPU memory configuration
+            gpus = tf.config.experimental.list_physical_devices('GPU')
+            if gpus:
+                try:
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+
+                    logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+                    print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+                except RuntimeError as e:
+                    print(e)
+
+            @keras.saving.register_keras_serializable()
+            class DataAugmentation(tf.keras.layers.Layer):
+                """Custom layer per l'augmentation dei dati"""
+
+                def __init__(self, noise_stddev=0.03, **kwargs):
+                    super().__init__(**kwargs)
+                    self.noise_stddev = noise_stddev
+
+                def call(self, inputs, training=None):
+                    if training:
+                        return inputs + tf.random.normal(
+                            shape=tf.shape(inputs),
+                            mean=0.0,
+                            stddev=self.noise_stddev
+                        )
+                    return inputs
+
+                def get_config(self):
+                    config = super().get_config()
+                    config.update({"noise_stddev": self.noise_stddev})
+                    return config
+
+            @keras.saving.register_keras_serializable()
+            class PositionalEncoding(tf.keras.layers.Layer):
+                """Custom layer per l'encoding posizionale"""
+
+                def __init__(self, d_model, **kwargs):
+                    super().__init__(**kwargs)
+                    self.d_model = d_model
+
+                def build(self, input_shape):
+                    _, seq_length, _ = input_shape
+
+                    # Crea la matrice di encoding posizionale
+                    position = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
+                    div_term = tf.exp(
+                        tf.range(0, self.d_model, 2, dtype=tf.float32) *
+                        (-tf.math.log(10000.0) / self.d_model)
+                    )
+
+                    # Calcola sin e cos
+                    pos_encoding = tf.zeros((1, seq_length, self.d_model))
+                    pos_encoding_even = tf.sin(position * div_term)
+                    pos_encoding_odd = tf.cos(position * div_term)
+
+                    # Assegna i valori alle posizioni pari e dispari
+                    pos_encoding = tf.concat(
+                        [tf.expand_dims(pos_encoding_even, -1),
+                         tf.expand_dims(pos_encoding_odd, -1)],
+                        axis=-1
+                    )
+                    pos_encoding = tf.reshape(pos_encoding, (1, seq_length, -1))
+                    pos_encoding = pos_encoding[:, :, :self.d_model]
+
+                    # Salva l'encoding come peso non trainabile
+                    self.pos_encoding = self.add_weight(
+                        shape=(1, seq_length, self.d_model),
+                        initializer=tf.keras.initializers.Constant(pos_encoding),
+                        trainable=False,
+                        name='positional_encoding'
+                    )
+
+                    super().build(input_shape)
+
+                def call(self, inputs):
+                    # Broadcast l'encoding posizionale sul batch
+                    batch_size = tf.shape(inputs)[0]
+                    pos_encoding_tiled = tf.tile(self.pos_encoding, [batch_size, 1, 1])
+                    return inputs + pos_encoding_tiled
+
+                def get_config(self):
+                    config = super().get_config()
+                    config.update({"d_model": self.d_model})
+                    return config
+
+            @keras.saving.register_keras_serializable()
+            class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+                """Custom learning rate schedule with linear warmup and exponential decay."""
+
+                def __init__(self, initial_learning_rate=1e-3, warmup_steps=500, decay_steps=5000):
+                    super().__init__()
+                    self.initial_learning_rate = initial_learning_rate
+                    self.warmup_steps = warmup_steps
+                    self.decay_steps = decay_steps
+
+                def __call__(self, step):
+                    warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
+                    warmup_lr = self.initial_learning_rate * warmup_pct
+                    decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
+                    decayed_lr = self.initial_learning_rate * decay_factor
+                    return tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
+
+                def get_config(self):
+                    return {
+                        'initial_learning_rate': self.initial_learning_rate,
+                        'warmup_steps': self.warmup_steps,
+                        'decay_steps': self.decay_steps
+                    }
+
+            @keras.saving.register_keras_serializable()
+            def weighted_huber_loss(y_true, y_pred):
+                # Pesi per diversi output
+                weights = tf.constant([1.0, 0.8, 0.8, 1.0, 0.6], dtype=tf.float32)
+                huber = tf.keras.losses.Huber(delta=1.0)
+                loss = huber(y_true, y_pred)
+                weighted_loss = tf.reduce_mean(loss * weights)
+                return weighted_loss
+
+            print("Caricamento modello...")
+
+            model_path = './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Modello non trovato in: {model_path}")
+
+            model = tf.keras.models.load_model(model_path, custom_objects={
+                'DataAugmentation': DataAugmentation,
+                'PositionalEncoding': PositionalEncoding,
+                'WarmUpLearningRateSchedule': WarmUpLearningRateSchedule,
+                'weighted_huber_loss': weighted_huber_loss
+            })
+            self.model = model
+            self.use_model = True
+        except Exception as e:
+            print(f"Errore nel caricamento del modello: {str(e)}")
+            self.model = None
+            self.use_model = False
+
+
+app_state = AppState()
 
 server = flask.Flask(__name__)
 server.secret_key = utils.SECRET_KEY
@@ -1202,8 +1374,8 @@ def create_configuration_tab():
                                         dcc.Dropdown(
                                             id='variety-1-dropdown',
                                             options=[{'label': v, 'value': v}
-                                                     for v in olive_varieties['Varietà di Olive'].unique()],
-                                            value=olive_varieties['Varietà di Olive'].iloc[0],
+                                                     for v in app_state.olive_varieties['Varietà di Olive'].unique()],
+                                            value=app_state.olive_varieties['Varietà di Olive'].iloc[0],
                                             className="mb-2"
                                         ),
                                     ], md=4),
@@ -1243,7 +1415,7 @@ def create_configuration_tab():
                                         dcc.Dropdown(
                                             id='variety-2-dropdown',
                                             options=[{'label': v, 'value': v}
-                                                     for v in olive_varieties['Varietà di Olive'].unique()],
+                                                     for v in app_state.olive_varieties['Varietà di Olive'].unique()],
                                             value=None,
                                             className="mb-2"
                                         ),
@@ -1286,7 +1458,7 @@ def create_configuration_tab():
                                         dcc.Dropdown(
                                             id='variety-3-dropdown',
                                             options=[{'label': v, 'value': v}
-                                                     for v in olive_varieties['Varietà di Olive'].unique()],
+                                                     for v in app_state.olive_varieties['Varietà di Olive'].unique()],
                                             value=None,
                                             className="mb-2"
                                         ),
@@ -1783,7 +1955,7 @@ app.layout = html.Div([
     dcc.Store(id='session', storage_type='local'),
     dcc.Store(id='user-data', storage_type='local'),
     dcc.Store(id=Ids.INFERENCE_COUNTER, storage_type='session', data={'count': 0}),
-    dcc.Store(id=Ids.DEV_MODE, storage_type='session', data={'count': 0}),
+    dcc.Store(id=Ids.USE_MODEL, storage_type='session', data={'count': 0}),
     html.Div(id=Ids.AUTH_CONTAINER),
     html.Div(id=Ids.DASHBOARD_CONTAINER),
 ])
@@ -2057,8 +2229,8 @@ def create_water_needs_figure(prediction):
     for detail in prediction['variety_details']:
         for month in months:
             season = get_season_from_month(month)
-            variety_info = olive_varieties[
-                olive_varieties['Varietà di Olive'] == detail['variety']
+            variety_info = app_state.olive_varieties[
+                app_state.olive_varieties['Varietà di Olive'] == detail['variety']
                 ].iloc[0]
 
             water_need = variety_info[f'Fabbisogno Acqua {season} (m³/ettaro)']
@@ -2129,34 +2301,6 @@ def get_season_from_month(month):
 
 
 @app.callback(
-    Output('loading-alert', 'children'),
-    [Input('simulate-btn', 'n_clicks'),
-     Input('debug-switch', 'value')],
-    running=[
-        (Output(Ids.DASHBOARD_CONTAINER, 'children'),
-         [Input('url', 'pathname')],
-         lambda x: x == '/')
-    ]
-)
-def update_loading_status(n_clicks, debug_mode):
-    global DEV_MODE
-
-    config = load_config()
-
-    DEV_MODE = config['inference']['debug_mode']
-    if not DEV_MODE and MODEL_LOADING:
-        return dbc.Alert(
-            [
-                html.I(className="fas fa-spinner fa-spin me-2"),
-                "Caricamento del modello in corso..."
-            ],
-            color="warning",
-            is_open=True
-        )
-    return None
-
-
-@app.callback(
     [
         Output(Ids.PRODUCTION_INFERENCE_MODE, 'children'),
         Output(Ids.PRODUCTION_INFERENCE_REQUESTS, 'children'),
@@ -2195,7 +2339,6 @@ def update_inference_status(debug_mode, counter_data):
     prevent_initial_call=True
 )
 def toggle_inference_mode(debug_mode):
-    global DEV_MODE, model, MODEL_LOADING, scaler_temporal, scaler_static, scaler_y
     new_counter_data = {'count': 0}
     try:
         config = load_config()
@@ -2204,12 +2347,11 @@ def toggle_inference_mode(debug_mode):
         config['inference'] = config.get('inference', {})  # Crea la sezione se non esiste
         config['inference']['debug_mode'] = debug_mode
 
-        DEV_MODE = debug_mode
-        print(f"DEV_MODE: {DEV_MODE}")
+        use_model = not debug_mode
+        print(f"use_model: {use_model}")
         dcc.Store(id=Ids.INFERENCE_COUNTER, data=new_counter_data)
-        if debug_mode:
-
-            MODEL_LOADING = False
+        app_state.use_model = use_model
+        if not use_model:
             return (
                 dbc.Alert("Modalità Debug attiva - Using mock predictions", color="info"),
                 "Debug (Mock)",
@@ -2218,174 +2360,15 @@ def toggle_inference_mode(debug_mode):
                 new_counter_data
             )
         else:
-            if model is None:
-                try:
-                    MODEL_LOADING = True
-                    print(f"Keras version: {keras.__version__}")
-                    print(f"TensorFlow version: {tf.__version__}")
-                    print(f"CUDA available: {tf.test.is_built_with_cuda()}")
-                    print(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
-
-                    # GPU memory configuration
-                    gpus = tf.config.experimental.list_physical_devices('GPU')
-                    if gpus:
-                        try:
-                            for gpu in gpus:
-                                tf.config.experimental.set_memory_growth(gpu, True)
-
-                            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-                            print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-                        except RuntimeError as e:
-                            print(e)
-
-                    @keras.saving.register_keras_serializable()
-                    class DataAugmentation(tf.keras.layers.Layer):
-                        """Custom layer per l'augmentation dei dati"""
-
-                        def __init__(self, noise_stddev=0.03, **kwargs):
-                            super().__init__(**kwargs)
-                            self.noise_stddev = noise_stddev
-
-                        def call(self, inputs, training=None):
-                            if training:
-                                return inputs + tf.random.normal(
-                                    shape=tf.shape(inputs),
-                                    mean=0.0,
-                                    stddev=self.noise_stddev
-                                )
-                            return inputs
-
-                        def get_config(self):
-                            config = super().get_config()
-                            config.update({"noise_stddev": self.noise_stddev})
-                            return config
-
-                    @keras.saving.register_keras_serializable()
-                    class PositionalEncoding(tf.keras.layers.Layer):
-                        """Custom layer per l'encoding posizionale"""
-
-                        def __init__(self, d_model, **kwargs):
-                            super().__init__(**kwargs)
-                            self.d_model = d_model
-
-                        def build(self, input_shape):
-                            _, seq_length, _ = input_shape
-
-                            # Crea la matrice di encoding posizionale
-                            position = tf.range(seq_length, dtype=tf.float32)[:, tf.newaxis]
-                            div_term = tf.exp(
-                                tf.range(0, self.d_model, 2, dtype=tf.float32) *
-                                (-tf.math.log(10000.0) / self.d_model)
-                            )
-
-                            # Calcola sin e cos
-                            pos_encoding = tf.zeros((1, seq_length, self.d_model))
-                            pos_encoding_even = tf.sin(position * div_term)
-                            pos_encoding_odd = tf.cos(position * div_term)
-
-                            # Assegna i valori alle posizioni pari e dispari
-                            pos_encoding = tf.concat(
-                                [tf.expand_dims(pos_encoding_even, -1),
-                                 tf.expand_dims(pos_encoding_odd, -1)],
-                                axis=-1
-                            )
-                            pos_encoding = tf.reshape(pos_encoding, (1, seq_length, -1))
-                            pos_encoding = pos_encoding[:, :, :self.d_model]
-
-                            # Salva l'encoding come peso non trainabile
-                            self.pos_encoding = self.add_weight(
-                                shape=(1, seq_length, self.d_model),
-                                initializer=tf.keras.initializers.Constant(pos_encoding),
-                                trainable=False,
-                                name='positional_encoding'
-                            )
-
-                            super().build(input_shape)
-
-                        def call(self, inputs):
-                            # Broadcast l'encoding posizionale sul batch
-                            batch_size = tf.shape(inputs)[0]
-                            pos_encoding_tiled = tf.tile(self.pos_encoding, [batch_size, 1, 1])
-                            return inputs + pos_encoding_tiled
-
-                        def get_config(self):
-                            config = super().get_config()
-                            config.update({"d_model": self.d_model})
-                            return config
-
-                    @keras.saving.register_keras_serializable()
-                    class WarmUpLearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-                        """Custom learning rate schedule with linear warmup and exponential decay."""
-
-                        def __init__(self, initial_learning_rate=1e-3, warmup_steps=500, decay_steps=5000):
-                            super().__init__()
-                            self.initial_learning_rate = initial_learning_rate
-                            self.warmup_steps = warmup_steps
-                            self.decay_steps = decay_steps
-
-                        def __call__(self, step):
-                            warmup_pct = tf.cast(step, tf.float32) / self.warmup_steps
-                            warmup_lr = self.initial_learning_rate * warmup_pct
-                            decay_factor = tf.pow(0.1, tf.cast(step, tf.float32) / self.decay_steps)
-                            decayed_lr = self.initial_learning_rate * decay_factor
-                            return tf.where(step < self.warmup_steps, warmup_lr, decayed_lr)
-
-                        def get_config(self):
-                            return {
-                                'initial_learning_rate': self.initial_learning_rate,
-                                'warmup_steps': self.warmup_steps,
-                                'decay_steps': self.decay_steps
-                            }
-
-                    @keras.saving.register_keras_serializable()
-                    def weighted_huber_loss(y_true, y_pred):
-                        # Pesi per diversi output
-                        weights = tf.constant([1.0, 0.8, 0.8, 1.0, 0.6], dtype=tf.float32)
-                        huber = tf.keras.losses.Huber(delta=1.0)
-                        loss = huber(y_true, y_pred)
-                        weighted_loss = tf.reduce_mean(loss * weights)
-                        return weighted_loss
-
-                    print("Caricamento modello...")
-
-                    # Verifica che il modello sia disponibile
-                    model_path = './sources/olive_oil_transformer/olive_oil_transformer_model.keras'
-                    if not os.path.exists(model_path):
-                        raise FileNotFoundError(f"Modello non trovato in: {model_path}")
-
-                    # Prova a caricare il modello
-                    model = tf.keras.models.load_model(model_path, custom_objects={
-                        'DataAugmentation': DataAugmentation,
-                        'PositionalEncoding': PositionalEncoding,
-                        'WarmUpLearningRateSchedule': WarmUpLearningRateSchedule,
-                        'weighted_huber_loss': weighted_huber_loss
-                    })
-                    MODEL_LOADING = False
-                    return (
-                        dbc.Alert("Modello caricato correttamente", color="success"),
-                        "Produzione (Local Model)",
-                        "~ 100ms",
-                        "0",
-                        new_counter_data
-                    )
-                except Exception as e:
-                    print(f"Errore nel caricamento del modello: {str(e)}")
-                    # Se c'è un errore nel caricamento del modello, torna in modalità debug
-                    DEV_MODE = True
-                    MODEL_LOADING = False
-                    return (
-                        dbc.Alert(f"Errore nel caricamento del modello: {str(e)}", color="danger"),
-                        "Debug (Mock) - Fallback",
-                        "N/A",
-                        "N/A",
-                        new_counter_data
-                    )
-
-            else:
-                MODEL_LOADING = False
+            return (
+                dbc.Alert("Modello caricato correttamente", color="success"),
+                "Produzione (Local Model)",
+                "~ 100ms",
+                "0",
+                new_counter_data
+            )
     except Exception as e:
         print(f"Errore nella configurazione inferenza: {str(e)}")
-        MODEL_LOADING = False
         return (
             dbc.Alert(f"Errore: {str(e)}", color="danger"),
             "Errore",
@@ -2440,7 +2423,6 @@ def display_page(pathname, session_data):
 
     is_valid, username = verify_token(session_data['token'])
     if not is_valid:
-        print("Invalid token")  # Debug print
         return create_login_layout(), html.Div()
 
     # print(f"Valid session for user: {username}")  # Debug print
@@ -2821,7 +2803,8 @@ def check_percentages(perc1, perc2, perc3):
         (Output(Ids.DASHBOARD_CONTAINER, 'children'),
          [Input('url', 'pathname')],
          lambda x: x == '/')
-    ]
+    ],
+    prevent_initial_call=True
 )
 def load_configuration(active_tab, var2_current, var3_current, pathname):
     try:
@@ -2831,10 +2814,7 @@ def load_configuration(active_tab, var2_current, var3_current, pathname):
         # Carica dati varietà
         varieties = config['oliveto']['varieties']
         var1 = varieties[0] if len(varieties) > 0 else {"variety": None, "technique": None, "percentage": 0}
-        var2 = varieties[1] if len(varieties) > 1 else {"variety": None, "technique": None, "percentage": 0}
-        var3 = varieties[2] if len(varieties) > 2 else {"variety": None, "technique": None, "percentage": 0}
 
-        print(var2_current)
         if var2_current is not None:
             var2 = next((v for v in varieties if v["variety"] == var2_current),
                         {"variety": var2_current, "technique": None, "percentage": 0})
@@ -2846,7 +2826,6 @@ def load_configuration(active_tab, var2_current, var3_current, pathname):
                         {"variety": var3_current, "technique": None, "percentage": 0})
         else:
             var3 = {"variety": None, "technique": None, "percentage": 0}
-
 
         # Carica costi e marketing
         costs = config['costs']
@@ -2937,7 +2916,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation, count
     """
     Callback principale per aggiornare tutti i componenti della simulazione
     """
-    if n_clicks is None or MODEL_LOADING:
+    if n_clicks is None:
         # Crea grafici vuoti per l'inizializzazione
         empty_growth_fig = go.Figure()
         empty_production_fig = go.Figure()
@@ -2993,9 +2972,9 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation, count
 
             # Estrai le informazioni dalle varietà configurate
             for variety_config in config['oliveto']['varieties']:
-                variety_data = olive_varieties[
-                    (olive_varieties['Varietà di Olive'] == variety_config['variety']) &
-                    (olive_varieties['Tecnica di Coltivazione'].str.lower() == variety_config['technique'].lower())
+                variety_data = app_state.olive_varieties[
+                    (app_state.olive_varieties['Varietà di Olive'] == variety_config['variety']) &
+                    (app_state.olive_varieties['Tecnica di Coltivazione'].str.lower() == variety_config['technique'].lower())
                     ]
                 if not variety_data.empty:
                     varieties_info.append(variety_data.iloc[0])
@@ -3003,7 +2982,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation, count
 
             current_count = counter_data.get('count', 0) + 1
 
-            prediction = make_prediction(weather_data, varieties_info, percentages, hectares, sim_data)
+            prediction = make_prediction(app_state.weather_data, varieties_info, percentages, hectares, sim_data)
 
             dcc.Store(id=Ids.INFERENCE_COUNTER, data={'count': current_count})
 
@@ -3019,7 +2998,7 @@ def update_simulation(n_clicks, temp_range, humidity, rainfall, radiation, count
 
             # Creazione grafici con il nuovo stile
             details_fig = create_production_details_figure(prediction)
-            weather_fig = create_weather_impact_figure(weather_data)
+            weather_fig = create_weather_impact_figure(app_state.weather_data)
             water_fig = {}  # create_water_needs_figure(prediction)
 
             # Creazione info extra con il nuovo stile
@@ -3160,18 +3139,40 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, help='Port to run the server on')
     parser.add_argument('--debug', action='store_true', help='Debug mode')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run the server on')
     args = parser.parse_args()
 
     env_port = int(os.environ.get('DASH_PORT', 8888))
     env_debug = os.environ.get('DASH_DEBUG', '').lower() == 'true'
+    env_host = os.environ.get('DASH_HOST', '0.0.0.0')
 
     port = args.port if args.port is not None else env_port
     debug = args.debug if args.debug else env_debug
+    host = args.host if args.host else env_host
 
-    print(f"Starting server on port {port} with debug={'on' if debug else 'off'}")
+    print(f"Starting server on {host}:{port} with debug={'on' if debug else 'off'}")
 
-    app.run_server(
-        host='0.0.0.0',
-        port=port,
-        debug=debug
+    # Configurazione del server
+    server.config.update(
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE='Lax',
     )
+
+    # Aggiunta middleware per la sicurezza
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    server.wsgi_app = ProxyFix(
+        server.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1
+    )
+
+    try:
+        app.run_server(
+            host=host,
+            port=port,
+            debug=debug,
+            ssl_context=None,  # Disabilita SSL a livello applicativo
+            threaded=True
+        )
+    except Exception as e:
+        print(f"Error starting server: {e}")

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Ids:
     # Auth Container
+    USE_MODEL = 'use-model'
     AUTH_CONTAINER = 'auth-container'
     DASHBOARD_CONTAINER = 'dashboard-container'
 
